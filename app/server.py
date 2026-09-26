@@ -157,61 +157,133 @@ async def optimize(mid):
     nv=min(s['max_voltage'],v+step);m['stability_trim']=nv-op_to_fv(x,s)[1]
     await set_fv(m,f,nv);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
    nx=max(0,x-s['op_step']);nf,bv=op_to_fv(nx,s);m['stability_trim']=s['max_voltage']-bv;await set_fv(m,nf,s['max_voltage']);m['effsearch']={};m['reason']=f'Max voltage still unstable — frequency ↓ to {nf:.0f} MHz, holding {s["max_voltage"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
-  # Constrained efficiency search near the fan/thermal limit.
-  # Compare: (A) lower voltage at same frequency vs (B) lower frequency at same voltage.
-  # Voltage UP is reserved for stability correction only.
+  # Adaptive coarse-to-fine efficiency search.
+  # Cooling targets and stability remain higher-priority constraints.
+  # Search only moves DOWN in voltage or frequency; voltage UP remains a stability correction.
   es=m.setdefault('effsearch',{})
   f=t.get('frequency') if t.get('frequency') is not None else op_to_fv(x,s)[0]
   v=t.get('voltage') if t.get('voltage') is not None else op_to_fv(x,s)[1]+m.get('stability_trim',0)
-  if es.get('base_f') is None or abs(es.get('base_f',f)-f)>0.5 or abs(es.get('base_v',v)-v)>0.5:
-   es.clear();es.update({'base_f':f,'base_v':v,'base_j':t.get('jth'),'phase':'ready','best_f':f,'best_v':v,'best_j':t.get('jth')});m['stable_since']=time.time()
+  now=time.time()
 
-  if m.get('stable_since') is None:m['stable_since']=time.time()
-  if time.time()-m['stable_since']>=s['stability_probe_seconds'] and stable(t,s) and t.get('jth') is not None:
-   vstep=max(1,s['stability_trim_decay'])
-   fstep=max(6.25,(s['max_frequency']-s['min_frequency'])*s['op_step'])
-   phase=es.get('phase','ready')
-   bf=es.get('base_f',f);bv=es.get('base_v',v);bj=es.get('base_j',t['jth'])
+  # Rolling samples let us compare averaged J/TH instead of noisy single snapshots.
+  if es.get('sample_f') is None or abs(es.get('sample_f',f)-f)>0.5 or abs(es.get('sample_v',v)-v)>0.5:
+   es['sample_f']=f;es['sample_v']=v;es['samples']=[];es['sample_since']=now
+  if t.get('jth') is not None:
+   es.setdefault('samples',[]).append(float(t['jth']))
+   es['samples']=es['samples'][-12:]
 
-   if phase=='score_vdown':
-    cand_asic_hot,cand_vr_hot,cand_fan_high,_,_,_=demands(t,s)
-    if stable(t,s) and (not cand_asic_hot) and (not cand_vr_hot) and (not cand_fan_high) and t['jth']<es.get('best_j',1e99):
-     es['best_f']=f;es['best_v']=v;es['best_j']=t['jth']
-    # Restore base, then test frequency lower while holding BASE voltage.
-    nf=max(s['min_frequency'],bf-fstep)
-    if nf<bf-0.1:
-     await set_fv(m,nf,bv);es['phase']='score_fdown';m['stable_since']=time.time()
-     m['reason']=f'Efficiency search — frequency ↓ {bf:.0f}→{nf:.0f} MHz, voltage held {bv:.0f} mV; voltage-down candidate was {t["jth"]:.2f} J/TH'
-     await asyncio.sleep(s['settle_seconds']);continue
-    es['phase']='score_fdown'
+  def avg_j():
+   vals=es.get('samples',[])
+   return sum(vals)/len(vals) if vals else None
 
-   if phase=='score_fdown' or es.get('phase')=='score_fdown':
-    cand_asic_hot,cand_vr_hot,cand_fan_high,_,_,_=demands(t,s)
-    if stable(t,s) and (not cand_asic_hot) and (not cand_vr_hot) and (not cand_fan_high) and t['jth']<es.get('best_j',1e99):
-     es['best_f']=f;es['best_v']=v;es['best_j']=t['jth']
-    sf=es.get('best_f',bf);sv=es.get('best_v',bv);sj=es.get('best_j',bj)
-    # Convert selected point back into baseline-frequency + persistent signed voltage trim.
-    sx=fv_to_op(sf,sv,s);_,sbv=op_to_fv(sx,s);m['stability_trim']=sv-sbv
-    await set_fv(m,sf,sv)
-    es.clear();es.update({'base_f':sf,'base_v':sv,'base_j':sj,'phase':'ready','best_f':sf,'best_v':sv,'best_j':sj})
-    m['stable_since']=time.time()
-    improved=(bj is not None and sj is not None and sj < bj*.998)
-    m['efficiency_lock']=bool(improved and s.get('headroom_priority','efficiency')=='efficiency')
-    m['reason']=f'Efficiency search — selected {sf:.0f} MHz / {sv:.0f} mV at {sj:.2f} J/TH' + ('; efficiency point protected from unused fan headroom' if m['efficiency_lock'] else '')
-    await asyncio.sleep(s['settle_seconds']);continue
+  # Meaningful coarse probes: enough movement to rise above normal telemetry noise.
+  coarse_v=max(25.0,float(s.get('stability_trim_decay',10))*2.0)
+  coarse_f=max(25.0,(s['max_frequency']-s['min_frequency'])*float(s.get('op_step',0.05)))
+  min_v_step=max(5.0,float(s.get('stability_trim_decay',10))/2.0)
+  min_f_step=6.25
+  improve_frac=0.005   # require 0.5% averaged J/TH improvement
+  sample_need=5
 
-   # Start with voltage-down candidate at fixed frequency.
-   es.update({'base_f':f,'base_v':v,'base_j':t['jth'],'best_f':f,'best_v':v,'best_j':t['jth']})
-   nv=max(s['min_voltage'],v-vstep)
+  phase=es.get('phase','init')
+
+  # Establish a measured baseline before probing.
+  if phase=='init' and len(es.get('samples',[]))>=sample_need and now-es.get('sample_since',now)>=s['settle_seconds']:
+   j=avg_j()
+   es.update({'phase':'probe_v','base_f':f,'base_v':v,'base_j':j,
+              'best_f':f,'best_v':v,'best_j':j,
+              'v_step':coarse_v,'f_step':coarse_f,'direction':None})
+   nv=max(s['min_voltage'],v-coarse_v)
    if nv<v-0.5:
-    await set_fv(m,f,nv);es['phase']='score_vdown';m['stable_since']=time.time()
-    m['reason']=f'Efficiency search — voltage ↓ {v:.0f}→{nv:.0f} mV, frequency held {f:.0f} MHz'
+    await set_fv(m,f,nv);es['sample_f']=f;es['sample_v']=nv;es['samples']=[];es['sample_since']=time.time()
+    m['reason']=f'Efficiency coarse probe — voltage ↓ {v:.0f}→{nv:.0f} mV at {f:.0f} MHz'
     await asyncio.sleep(s['settle_seconds']);continue
-   nf=max(s['min_frequency'],f-fstep)
-   if nf<f-0.1:
-    await set_fv(m,nf,v);es['phase']='score_fdown';m['stable_since']=time.time()
-    m['reason']=f'Efficiency search — voltage at minimum; frequency ↓ {f:.0f}→{nf:.0f} MHz at {v:.0f} mV'
+   es['phase']='probe_f'
+
+  # Score voltage-down coarse/fine candidate, then test frequency-down from baseline.
+  if es.get('phase')=='probe_v' and len(es.get('samples',[]))>=sample_need and now-es.get('sample_since',now)>=s['settle_seconds']:
+   cj=avg_j();es['v_candidate']=(f,v,cj)
+   bf,bv=es['base_f'],es['base_v']
+   nf=max(s['min_frequency'],bf-es.get('f_step',coarse_f))
+   if nf<bf-0.1:
+    await set_fv(m,nf,bv);es['phase']='probe_f';es['sample_f']=nf;es['sample_v']=bv;es['samples']=[];es['sample_since']=time.time()
+    m['reason']=f'Efficiency coarse probe — frequency ↓ {bf:.0f}→{nf:.0f} MHz at {bv:.0f} mV'
     await asyncio.sleep(s['settle_seconds']);continue
+   es['phase']='choose'
+
+  # Score frequency candidate and choose a promising direction only if improvement is meaningful.
+  if es.get('phase')=='probe_f' and len(es.get('samples',[]))>=sample_need and now-es.get('sample_since',now)>=s['settle_seconds']:
+   es['f_candidate']=(f,v,avg_j());es['phase']='choose'
+
+  if es.get('phase')=='choose':
+   bf,bv,bj=es['base_f'],es['base_v'],es['base_j']
+   candidates=[]
+   for direction,key in [('v','v_candidate'),('f','f_candidate')]:
+    c=es.get(key)
+    if c:
+     cf,cv,cj=c
+     # Candidate must still satisfy cooling targets and stability.
+     ca,cvh,cfh,_,_,_=demands(t,s) if abs(cf-f)<0.5 and abs(cv-v)<0.5 else (False,False,False,False,False,False)
+     if cj is not None and cj < bj*(1-improve_frac):
+      candidates.append((cj,direction,cf,cv))
+   if candidates:
+    cj,direction,cf,cv=min(candidates,key=lambda q:q[0])
+    es['direction']=direction;es['best_f']=cf;es['best_v']=cv;es['best_j']=cj
+    await set_fv(m,cf,cv)
+    es['phase']='walk';es['sample_f']=cf;es['sample_v']=cv;es['samples']=[];es['sample_since']=time.time()
+    m['reason']=f'Efficiency search — {("voltage" if direction=="v" else "frequency")}↓ is promising ({bj:.2f}→{cj:.2f} J/TH avg); walking that direction'
+    await asyncio.sleep(s['settle_seconds']);continue
+   # No coarse direction beat noise threshold: restore baseline and wait before another search.
+   await set_fv(m,bf,bv);es.clear();es.update({'phase':'cooldown','sample_f':bf,'sample_v':bv,'samples':[],'sample_since':time.time(),'cooldown_until':time.time()+max(60,s['stability_probe_seconds'])})
+   m['reason']=f'Efficiency search — no meaningful (>0.5%) coarse improvement; holding {bf:.0f} MHz / {bv:.0f} mV'
+   await asyncio.sleep(s['settle_seconds']);continue
+
+  # Walk the winning direction while averaged J/TH improves meaningfully.
+  if es.get('phase')=='walk' and len(es.get('samples',[]))>=sample_need and now-es.get('sample_since',now)>=s['settle_seconds']:
+   cj=avg_j();bj=es.get('best_j',cj);direction=es.get('direction')
+   asic_bad,vr_bad,fan_bad,_,_,_=demands(t,s)
+   good=stable(t,s) and not asic_bad and not vr_bad and not fan_bad
+   if good and cj is not None and cj < bj*(1-improve_frac):
+    es['best_f']=f;es['best_v']=v;es['best_j']=cj
+    step=es['v_step'] if direction=='v' else es['f_step']
+    if direction=='v':
+     nv=max(s['min_voltage'],v-step);nf=f
+    else:
+     nf=max(s['min_frequency'],f-step);nv=v
+    if abs(nf-f)>0.1 or abs(nv-v)>0.5:
+     await set_fv(m,nf,nv);es['sample_f']=nf;es['sample_v']=nv;es['samples']=[];es['sample_since']=time.time()
+     m['reason']=f'Efficiency search — continuing {direction}↓; best averaged J/TH {cj:.2f}'
+     await asyncio.sleep(s['settle_seconds']);continue
+
+   # We crossed/failed to improve: return to best and halve the directional step.
+   bf,bv,bj=es['best_f'],es['best_v'],es['best_j']
+   if direction=='v': es['v_step']=es.get('v_step',coarse_v)/2.0;step=es['v_step'];done=step<min_v_step
+   else: es['f_step']=es.get('f_step',coarse_f)/2.0;step=es['f_step'];done=step<min_f_step
+   await set_fv(m,bf,bv)
+   if done:
+    bx=fv_to_op(bf,bv,s);_,basev=op_to_fv(bx,s);m['stability_trim']=bv-basev
+    m['efficiency_lock']=s.get('headroom_priority','efficiency')=='efficiency'
+    es.clear();es.update({'phase':'cooldown','sample_f':bf,'sample_v':bv,'samples':[],'sample_since':time.time(),'cooldown_until':time.time()+max(120,s['stability_probe_seconds']*2)})
+    m['reason']=f'Efficiency optimum learned — {bf:.0f} MHz / {bv:.0f} mV, {bj:.2f} J/TH avg'
+   else:
+    # Refine from best using half-sized step in remembered winning direction.
+    es['phase']='refine';es['sample_f']=bf;es['sample_v']=bv;es['samples']=[];es['sample_since']=time.time()
+    m['reason']=f'Efficiency search — bracketed best point; refining {direction}↓ with {step:.1f} {"mV" if direction=="v" else "MHz"} step'
+   await asyncio.sleep(s['settle_seconds']);continue
+
+  if es.get('phase')=='refine' and len(es.get('samples',[]))>=sample_need and now-es.get('sample_since',now)>=s['settle_seconds']:
+   direction=es.get('direction');bf,bv=es['best_f'],es['best_v']
+   if direction=='v': nf=bf;nv=max(s['min_voltage'],bv-es['v_step'])
+   else: nf=max(s['min_frequency'],bf-es['f_step']);nv=bv
+   if abs(nf-bf)>0.1 or abs(nv-bv)>0.5:
+    await set_fv(m,nf,nv);es['phase']='walk';es['sample_f']=nf;es['sample_v']=nv;es['samples']=[];es['sample_since']=time.time()
+    m['reason']=f'Efficiency fine probe — {direction}↓ to {nf:.0f} MHz / {nv:.0f} mV'
+    await asyncio.sleep(s['settle_seconds']);continue
+
+  if es.get('phase')=='cooldown':
+   if now < es.get('cooldown_until',0):
+    pass
+   else:
+    es.clear();es.update({'phase':'init','sample_f':f,'sample_v':v,'samples':[],'sample_since':now})
   # Shared cooling: either ASIC or VRM can trigger AxeOS fan takeover at minimum. Separate/passive VRM cannot be independently commanded by current AxeOS API.
   at_min=x<=0.01
   need_takeover=at_min and (asic_hot or (vr_hot and s['vr_cooling']=='shared'))

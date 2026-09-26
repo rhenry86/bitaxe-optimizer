@@ -4,7 +4,7 @@ name: Bitaxe Optimizer
 tagline: Optimize Bitaxe miners for temperature, fan speed, stability, and efficiency
 icon: https://raw.githubusercontent.com/rhenry86/bitaxe-optimizer/main/rhenry86-bitaxe-optimizer/icon.svg
 category: bitcoin
-version: "2.1.1"
+version: "2.2.0"
 port: 8080
 description: Automatically tunes Bitaxe/AxeOS miners while balancing ASIC temperature and fan-speed targets, VRM thermals, stability limits, and measured J/TH efficiency.
 developer: rhenry86
@@ -14,7 +14,7 @@ submission: https://github.com/rhenry86/bitaxe-optimizer
 repo: https://github.com/rhenry86/bitaxe-optimizer
 support: https://github.com/rhenry86/bitaxe-optimizer/issues
 gallery: []
-releaseNotes: Clarifies Headroom Priority as an unused-cooling-headroom policy only. Fan/ASIC/VRM target bands remain higher-priority constraints, and efficiency candidates that exceed those target bands cannot win even with better J/TH.
+releaseNotes: Adaptive coarse-to-fine efficiency search. Uses averaged J/TH samples, meaningful voltage/frequency-down probes, remembers the winning direction, walks it until efficiency stops improving, then halves the step to refine the optimum. Cooling and stability constraints remain higher priority.
 dependencies: []
 path: ""
 defaultUsername: ""
