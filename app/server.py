@@ -174,7 +174,8 @@ async def optimize(mid):
    bf=es.get('base_f',f);bv=es.get('base_v',v);bj=es.get('base_j',t['jth'])
 
    if phase=='score_vdown':
-    if stable(t,s) and t['jth']<es.get('best_j',1e99):
+    cand_asic_hot,cand_vr_hot,cand_fan_high,_,_,_=demands(t,s)
+    if stable(t,s) and (not cand_asic_hot) and (not cand_vr_hot) and (not cand_fan_high) and t['jth']<es.get('best_j',1e99):
      es['best_f']=f;es['best_v']=v;es['best_j']=t['jth']
     # Restore base, then test frequency lower while holding BASE voltage.
     nf=max(s['min_frequency'],bf-fstep)
@@ -185,7 +186,8 @@ async def optimize(mid):
     es['phase']='score_fdown'
 
    if phase=='score_fdown' or es.get('phase')=='score_fdown':
-    if stable(t,s) and t['jth']<es.get('best_j',1e99):
+    cand_asic_hot,cand_vr_hot,cand_fan_high,_,_,_=demands(t,s)
+    if stable(t,s) and (not cand_asic_hot) and (not cand_vr_hot) and (not cand_fan_high) and t['jth']<es.get('best_j',1e99):
      es['best_f']=f;es['best_v']=v;es['best_j']=t['jth']
     sf=es.get('best_f',bf);sv=es.get('best_v',bv);sj=es.get('best_j',bj)
     # Convert selected point back into baseline-frequency + persistent signed voltage trim.
@@ -236,7 +238,7 @@ async def optimize(mid):
     nx=min(1,x+s['op_step'])
     if nx>x+0.0001:
      await set_op(m,nx);m['effsearch']={};m['stable_since']=time.time();m['reason']=f'Fan headroom — coupled F/V ↑ to {nx*100:.0f}% with learned voltage trim {m.get("stability_trim",0):+.0f} mV ({priority} priority)';await asyncio.sleep(s['settle_seconds']);continue
-   m['reason']=f'Efficiency priority — preserving learned J/TH optimum despite fan headroom ({t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target)'
+   m['reason']=f'Unused cooling headroom — Efficiency priority preserving learned J/TH optimum (fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target)'
   m['reason']=f'Holding frequency; voltage trim {m.get("stability_trim",0):+.0f} mV — waiting for next efficiency probe'
   await asyncio.sleep(s['settle_seconds'])
 
