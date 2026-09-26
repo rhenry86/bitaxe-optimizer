@@ -1,0 +1,12 @@
+version: "3.7"
+services:
+  app_proxy:
+    environment:
+      APP_HOST: rhenry86-bitaxe-optimizer_web_1
+      APP_PORT: 8080
+  web:
+    image: ghcr.io/rhenry86/bitaxe-optimizer:latest
+    restart: on-failure
+    stop_grace_period: 30s
+    volumes:
+      - ${APP_DATA_DIR}/data:/data
