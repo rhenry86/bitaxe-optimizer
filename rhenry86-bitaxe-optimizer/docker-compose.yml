@@ -1,10 +1,13 @@
 version: "3.7"
 services:
   app_proxy:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     environment:
-      APP_HOST: rhenry86-bitaxe-optimizer_web_1
+      APP_HOST: host.docker.internal
       APP_PORT: 8080
   web:
+    network_mode: host
     image: ghcr.io/rhenry86/bitaxe-optimizer:latest
     restart: on-failure
     stop_grace_period: 30s
