@@ -37,7 +37,7 @@ def init():
  c=con();c.execute('CREATE TABLE IF NOT EXISTS miners(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,host TEXT,settings TEXT)')
  c.execute('CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY AUTOINCREMENT,miner_id INTEGER,ts REAL,payload TEXT)')
  for r in c.execute('SELECT * FROM miners'):
-  s=merged_settings(json.loads(r['settings'])); miners[r['id']]={'id':r['id'],'name':r['name'],'host':r['host'],'settings':s,'online':False,'telemetry':{},'reason':'Idle','mode':'paused','recovery_since':None,'last_shares':None,'stability_trim':0.0,'stable_since':None}
+  s=merged_settings(json.loads(r['settings'])); miners[r['id']]={'id':r['id'],'name':r['name'],'host':r['host'],'settings':s,'online':False,'telemetry':{},'reason':'Idle','mode':'paused','recovery_since':None,'last_shares':None,'stability_trim':0.0,'effsearch':{},'stable_since':None}
   c.execute('UPDATE miners SET settings=? WHERE id=?',(json.dumps(s),r['id']))
  c.commit();c.close()
 def base(host):
@@ -155,18 +155,61 @@ async def optimize(mid):
    step=s['stability_voltage_step'];m['stable_since']=None;m['recovery_since']=None
    if v < s['max_voltage']-0.5:
     nv=min(s['max_voltage'],v+step);m['stability_trim']=nv-op_to_fv(x,s)[1]
-    await set_fv(m,f,nv);m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
-   nx=max(0,x-s['op_step']);nf,bv=op_to_fv(nx,s);m['stability_trim']=s['max_voltage']-bv;await set_fv(m,nf,s['max_voltage']);m['reason']=f'Max voltage still unstable — frequency ↓ to {nf:.0f} MHz, holding {s["max_voltage"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
-  # Stable operation: independently probe voltage DOWN while frequency stays fixed.
-  # This searches for efficiency and is allowed to create a negative trim.
+    await set_fv(m,f,nv);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
+   nx=max(0,x-s['op_step']);nf,bv=op_to_fv(nx,s);m['stability_trim']=s['max_voltage']-bv;await set_fv(m,nf,s['max_voltage']);m['effsearch']={};m['reason']=f'Max voltage still unstable — frequency ↓ to {nf:.0f} MHz, holding {s["max_voltage"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+  # Constrained efficiency search near the fan/thermal limit.
+  # Compare: (A) lower voltage at same frequency vs (B) lower frequency at same voltage.
+  # Voltage UP is reserved for stability correction only.
+  es=m.setdefault('effsearch',{})
+  f=t.get('frequency') if t.get('frequency') is not None else op_to_fv(x,s)[0]
+  v=t.get('voltage') if t.get('voltage') is not None else op_to_fv(x,s)[1]+m.get('stability_trim',0)
+  if es.get('base_f') is None or abs(es.get('base_f',f)-f)>0.5 or abs(es.get('base_v',v)-v)>0.5:
+   es.clear();es.update({'base_f':f,'base_v':v,'base_j':t.get('jth'),'phase':'ready','best_f':f,'best_v':v,'best_j':t.get('jth')});m['stable_since']=time.time()
+
   if m.get('stable_since') is None:m['stable_since']=time.time()
-  if time.time()-m['stable_since']>=s['stability_probe_seconds'] and t.get('error_pct',0)<s['max_error_pct'] and t.get('reject_pct',0)<s['max_reject_pct']:
-   f=t.get('frequency') if t.get('frequency') is not None else op_to_fv(x,s)[0]
-   v=t.get('voltage') if t.get('voltage') is not None else op_to_fv(x,s)[1]+m.get('stability_trim',0)
-   nv=max(s['min_voltage'],v-s['stability_trim_decay'])
+  if time.time()-m['stable_since']>=s['stability_probe_seconds'] and stable(t,s) and t.get('jth') is not None:
+   vstep=max(1,s['stability_trim_decay'])
+   fstep=max(6.25,(s['max_frequency']-s['min_frequency'])*s['op_step'])
+   phase=es.get('phase','ready')
+   bf=es.get('base_f',f);bv=es.get('base_v',v);bj=es.get('base_j',t['jth'])
+
+   if phase=='score_vdown':
+    if stable(t,s) and t['jth']<es.get('best_j',1e99):
+     es['best_f']=f;es['best_v']=v;es['best_j']=t['jth']
+    # Restore base, then test frequency lower while holding BASE voltage.
+    nf=max(s['min_frequency'],bf-fstep)
+    if nf<bf-0.1:
+     await set_fv(m,nf,bv);es['phase']='score_fdown';m['stable_since']=time.time()
+     m['reason']=f'Efficiency search — frequency ↓ {bf:.0f}→{nf:.0f} MHz, voltage held {bv:.0f} mV; voltage-down candidate was {t["jth"]:.2f} J/TH'
+     await asyncio.sleep(s['settle_seconds']);continue
+    es['phase']='score_fdown'
+
+   if phase=='score_fdown' or es.get('phase')=='score_fdown':
+    if stable(t,s) and t['jth']<es.get('best_j',1e99):
+     es['best_f']=f;es['best_v']=v;es['best_j']=t['jth']
+    sf=es.get('best_f',bf);sv=es.get('best_v',bv);sj=es.get('best_j',bj)
+    # Convert selected point back into baseline-frequency + persistent signed voltage trim.
+    sx=fv_to_op(sf,sv,s);_,sbv=op_to_fv(sx,s);m['stability_trim']=sv-sbv
+    await set_fv(m,sf,sv)
+    es.clear();es.update({'base_f':sf,'base_v':sv,'base_j':sj,'phase':'ready','best_f':sf,'best_v':sv,'best_j':sj})
+    m['stable_since']=time.time()
+    improved=(bj is not None and sj is not None and sj < bj*.998)
+    m['efficiency_lock']=bool(improved and s.get('headroom_priority','efficiency')=='efficiency')
+    m['reason']=f'Efficiency search — selected {sf:.0f} MHz / {sv:.0f} mV at {sj:.2f} J/TH' + ('; efficiency point protected from unused fan headroom' if m['efficiency_lock'] else '')
+    await asyncio.sleep(s['settle_seconds']);continue
+
+   # Start with voltage-down candidate at fixed frequency.
+   es.update({'base_f':f,'base_v':v,'base_j':t['jth'],'best_f':f,'best_v':v,'best_j':t['jth']})
+   nv=max(s['min_voltage'],v-vstep)
    if nv<v-0.5:
-    m['stability_trim']=nv-op_to_fv(x,s)[1]
-    await set_fv(m,f,nv);m['stable_since']=time.time();m['reason']=f'Efficiency probe — holding {f:.0f} MHz, voltage ↓ {v:.0f}→{nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}%/{s["max_error_pct"]:.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
+    await set_fv(m,f,nv);es['phase']='score_vdown';m['stable_since']=time.time()
+    m['reason']=f'Efficiency search — voltage ↓ {v:.0f}→{nv:.0f} mV, frequency held {f:.0f} MHz'
+    await asyncio.sleep(s['settle_seconds']);continue
+   nf=max(s['min_frequency'],f-fstep)
+   if nf<f-0.1:
+    await set_fv(m,nf,v);es['phase']='score_fdown';m['stable_since']=time.time()
+    m['reason']=f'Efficiency search — voltage at minimum; frequency ↓ {f:.0f}→{nf:.0f} MHz at {v:.0f} mV'
+    await asyncio.sleep(s['settle_seconds']);continue
   # Shared cooling: either ASIC or VRM can trigger AxeOS fan takeover at minimum. Separate/passive VRM cannot be independently commanded by current AxeOS API.
   at_min=x<=0.01
   need_takeover=at_min and (asic_hot or (vr_hot and s['vr_cooling']=='shared'))
@@ -185,9 +228,15 @@ async def optimize(mid):
    m['mode']='optimizing';m['recovery_since']=None;m['reason']='Thermally recovered — resuming slow coupled F/V optimization'
   # Any target demand retreats F/V. Fan target matters in normal operation; VR target always protects VRM.
   if asic_hot or vr_hot or fan_high:
-   nx=max(0,x-s['op_step']);await set_op(m,nx);m['stable_since']=time.time();m['reason']=f'Thermal/fan demand — coupled F/V ↓ to {nx*100:.0f}% while preserving voltage trim {m.get("stability_trim",0):+.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+   nx=max(0,x-s['op_step']);await set_op(m,nx);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=f'Thermal/fan demand — coupled F/V ↓ to {nx*100:.0f}% while preserving voltage trim {m.get("stability_trim",0):+.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
   if (not asic_hot) and (not vr_hot) and fan_low:
-   nx=min(1,x+s['op_step']);await set_op(m,nx);m['stable_since']=time.time();m['reason']=f'Fan headroom — coupled F/V ↑ to {nx*100:.0f}% with learned voltage trim {m.get("stability_trim",0):+.0f} mV (fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target)';await asyncio.sleep(s['settle_seconds']);continue
+   priority=s.get('headroom_priority','efficiency')
+   learned_efficiency=bool(m.get('efficiency_lock',False))
+   if priority=='performance' or not learned_efficiency:
+    nx=min(1,x+s['op_step'])
+    if nx>x+0.0001:
+     await set_op(m,nx);m['effsearch']={};m['stable_since']=time.time();m['reason']=f'Fan headroom — coupled F/V ↑ to {nx*100:.0f}% with learned voltage trim {m.get("stability_trim",0):+.0f} mV ({priority} priority)';await asyncio.sleep(s['settle_seconds']);continue
+   m['reason']=f'Efficiency priority — preserving learned J/TH optimum despite fan headroom ({t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target)'
   m['reason']=f'Holding frequency; voltage trim {m.get("stability_trim",0):+.0f} mV — waiting for next efficiency probe'
   await asyncio.sleep(s['settle_seconds'])
 
@@ -295,7 +344,7 @@ async def ls():return list(miners.values())
 @app.post('/api/miners')
 async def add(x:MinerIn):
  c=con();q=c.execute('INSERT INTO miners(name,host,settings) VALUES(?,?,?)',(x.name,x.host,json.dumps(DEFAULT)));mid=q.lastrowid;c.commit();c.close()
- miners[mid]={'id':mid,'name':x.name,'host':x.host,'settings':dict(DEFAULT),'online':False,'telemetry':{},'reason':'Starting telemetry','mode':'paused','recovery_since':None,'last_shares':None,'stability_trim':0.0,'stable_since':None};asyncio.create_task(poll(mid));return miners[mid]
+ miners[mid]={'id':mid,'name':x.name,'host':x.host,'settings':dict(DEFAULT),'online':False,'telemetry':{},'reason':'Starting telemetry','mode':'paused','recovery_since':None,'last_shares':None,'stability_trim':0.0,'effsearch':{},'stable_since':None};asyncio.create_task(poll(mid));return miners[mid]
 @app.delete('/api/miners/{mid}')
 async def rem(mid:int):
  if mid not in miners:raise HTTPException(404)
