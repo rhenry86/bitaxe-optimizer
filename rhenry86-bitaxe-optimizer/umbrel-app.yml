@@ -4,9 +4,9 @@ name: Bitaxe Optimizer
 tagline: Optimize Bitaxe miners for temperature, fan speed, stability, and efficiency
 icon: https://raw.githubusercontent.com/rhenry86/bitaxe-optimizer/main/rhenry86-bitaxe-optimizer/icon.svg
 category: bitcoin
-version: "1.0.0"
+version: "1.4.0"
 port: 8080
-description: Automatically tunes Bitaxe/AxeOS miners while balancing ASIC temperature and fan-speed targets, stability limits, and measured J/TH efficiency.
+description: Automatically tunes Bitaxe/AxeOS miners while balancing ASIC temperature and fan-speed targets, VRM thermals, stability limits, and measured J/TH efficiency.
 developer: rhenry86
 website: https://github.com/rhenry86/bitaxe-optimizer
 submitter: rhenry86
@@ -14,7 +14,7 @@ submission: https://github.com/rhenry86/bitaxe-optimizer
 repo: https://github.com/rhenry86/bitaxe-optimizer
 support: https://github.com/rhenry86/bitaxe-optimizer/issues
 gallery: []
-releaseNotes: Initial release.
+releaseNotes: Adds automatic LAN miner discovery and voltage-first hardware-error stability correction.
 dependencies: []
 path: ""
 defaultUsername: ""
