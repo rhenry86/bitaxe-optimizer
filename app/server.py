@@ -157,6 +157,64 @@ async def optimize(mid):
     nv=min(s['max_voltage'],v+step);m['stability_trim']=nv-op_to_fv(x,s)[1]
     await set_fv(m,f,nv);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
    nx=max(0,x-s['op_step']);nf,bv=op_to_fv(nx,s);m['stability_trim']=s['max_voltage']-bv;await set_fv(m,nf,s['max_voltage']);m['effsearch']={};m['reason']=f'Max voltage still unstable — frequency ↓ to {nf:.0f} MHz, holding {s["max_voltage"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+  # Probe-fault protection for multi-ASIC miners.
+  # If a search probe causes >5% hashrate loss, restore last known-good F/V,
+  # remember that unsafe boundary, and pause further probing.
+  pf=m.setdefault('probe_fault',{})
+  active_es=m.get('effsearch') or {}
+  if active_es.get('probe_good_hash') and active_es.get('phase') in ('probe_v','probe_f','walk','refine'):
+   gh=active_es['probe_good_hash'];ch=t.get('hashrate')
+   if ch is not None and ch < gh*(1-float(s.get('probe_hash_drop_pct',5))/100.0):
+    bad_f=t.get('frequency');bad_v=t.get('voltage')
+    good_f=active_es.get('last_good_f',active_es.get('base_f',bad_f))
+    good_v=active_es.get('last_good_v',active_es.get('base_v',bad_v))
+    if bad_v is not None and good_v is not None and bad_v < good_v:
+     pf['unsafe_below_v']=bad_v
+     pf['safe_min_v']=min(s['max_voltage'],bad_v+s.get('probe_fault_guard_mv',15))
+    if bad_f is not None and good_f is not None and bad_f < good_f:
+     pf['unsafe_below_f']=bad_f
+     pf['safe_min_f']=min(s['max_frequency'],bad_f+s.get('probe_fault_guard_mhz',12.5))
+    pf['fault_time']=time.time()
+    pf['restart_check_at']=time.time()+s.get('probe_restart_delay',20)
+    pf['recover_until']=time.time()+s.get('probe_recovery_seconds',120)
+    pf['good_f']=good_f;pf['good_v']=good_v;pf['good_hash']=gh;pf['restart_sent']=False
+    await set_fv(m,good_f,good_v)
+    m['effsearch']={};m['efficiency_lock']=False
+    m['reason']=f'Probe fault — hashrate collapsed >{s.get("probe_hash_drop_pct",5):.0f}%; restored last known-good F/V, checking recovery before restart'
+    await asyncio.sleep(s['settle_seconds']);continue
+
+  # If a probe fault persists after restoring known-good F/V, restart AxeOS.
+  pf=m.setdefault('probe_fault',{})
+  if pf.get('restart_check_at') and not pf.get('restart_sent') and time.time()>=pf['restart_check_at']:
+   gh=pf.get('good_hash');ch=t.get('hashrate')
+   if gh and ch is not None and ch < gh*(1-float(s.get('probe_hash_drop_pct',5))/100.0):
+    try:
+     async with httpx.AsyncClient(timeout=10) as c:
+      r=await c.post(f'http://{m["host"]}/api/system/restart')
+      r.raise_for_status()
+     pf['restart_sent']=True;pf['restart_time']=time.time()
+     pf['recover_until']=time.time()+s.get('probe_restart_timeout',180)
+     m['reason']='ASIC remained degraded after probe fault — AxeOS restart sent; waiting for miner recovery'
+     await asyncio.sleep(10);continue
+    except Exception as e:
+     m['reason']=f'ASIC restart attempt failed: {e}'
+     pf['restart_check_at']=time.time()+15
+     await asyncio.sleep(5);continue
+   else:
+    pf['restart_check_at']=None;pf['recover_until']=time.time()+s.get('probe_recovery_seconds',120)
+    m['reason']='Probe fault recovered without restart — holding known-good point before resuming search'
+
+  # After an automatic restart, require recovered hashrate before allowing searches again.
+  if pf.get('restart_sent'):
+   gh=pf.get('good_hash');ch=t.get('hashrate')
+   if gh and ch is not None and ch >= gh*(1-float(s.get('probe_hash_drop_pct',5))/100.0):
+    pf['restart_sent']=False;pf['restart_check_at']=None
+    pf['recover_until']=time.time()+s.get('probe_recovery_seconds',120)
+    m['reason']='AxeOS restart recovered hashrate — stabilization hold active'
+   elif time.time() < pf.get('recover_until',0):
+    m['reason']='Waiting for AxeOS restart / ASIC hashrate recovery'
+    await asyncio.sleep(10);continue
+
   # Adaptive coarse-to-fine efficiency search.
   # Cooling targets and stability remain higher-priority constraints.
   # Search only moves DOWN in voltage or frequency; voltage UP remains a stability correction.
@@ -185,14 +243,17 @@ async def optimize(mid):
   sample_need=5
 
   phase=es.get('phase','init')
+  if now < pf.get('recover_until',0):
+   m['reason']=f'Probe recovery hold — {pf.get("good_f",f):.0f} MHz / {pf.get("good_v",v):.0f} mV'
+   await asyncio.sleep(min(10,max(1,pf['recover_until']-now)));continue
 
   # Establish a measured baseline before probing.
   if phase=='init' and len(es.get('samples',[]))>=sample_need and now-es.get('sample_since',now)>=s['settle_seconds']:
    j=avg_j()
-   es.update({'phase':'probe_v','base_f':f,'base_v':v,'base_j':j,
+   es.update({'phase':'probe_v','base_f':f,'base_v':v,'base_j':j,'probe_good_hash':t.get('hashrate'),'last_good_f':f,'last_good_v':v,
               'best_f':f,'best_v':v,'best_j':j,
               'v_step':coarse_v,'f_step':coarse_f,'direction':None})
-   nv=max(s['min_voltage'],v-coarse_v)
+   nv=max(s['min_voltage'],pf.get('safe_min_v',s['min_voltage']),v-coarse_v)
    if nv<v-0.5:
     await set_fv(m,f,nv);es['sample_f']=f;es['sample_v']=nv;es['samples']=[];es['sample_since']=time.time()
     m['reason']=f'Efficiency coarse probe — voltage ↓ {v:.0f}→{nv:.0f} mV at {f:.0f} MHz'
@@ -203,7 +264,7 @@ async def optimize(mid):
   if es.get('phase')=='probe_v' and len(es.get('samples',[]))>=sample_need and now-es.get('sample_since',now)>=s['settle_seconds']:
    cj=avg_j();es['v_candidate']=(f,v,cj)
    bf,bv=es['base_f'],es['base_v']
-   nf=max(s['min_frequency'],bf-es.get('f_step',coarse_f))
+   nf=max(s['min_frequency'],pf.get('safe_min_f',s['min_frequency']),bf-es.get('f_step',coarse_f))
    if nf<bf-0.1:
     await set_fv(m,nf,bv);es['phase']='probe_f';es['sample_f']=nf;es['sample_v']=bv;es['samples']=[];es['sample_since']=time.time()
     m['reason']=f'Efficiency coarse probe — frequency ↓ {bf:.0f}→{nf:.0f} MHz at {bv:.0f} mV'
@@ -243,12 +304,12 @@ async def optimize(mid):
    asic_bad,vr_bad,fan_bad,_,_,_=demands(t,s)
    good=stable(t,s) and not asic_bad and not vr_bad and not fan_bad
    if good and cj is not None and cj < bj*(1-improve_frac):
-    es['best_f']=f;es['best_v']=v;es['best_j']=cj
+    es['best_f']=f;es['best_v']=v;es['best_j']=cj;es['last_good_f']=f;es['last_good_v']=v;es['probe_good_hash']=t.get('hashrate')
     step=es['v_step'] if direction=='v' else es['f_step']
     if direction=='v':
-     nv=max(s['min_voltage'],v-step);nf=f
+     nv=max(s['min_voltage'],pf.get('safe_min_v',s['min_voltage']),v-step);nf=f
     else:
-     nf=max(s['min_frequency'],f-step);nv=v
+     nf=max(s['min_frequency'],pf.get('safe_min_f',s['min_frequency']),f-step);nv=v
     if abs(nf-f)>0.1 or abs(nv-v)>0.5:
      await set_fv(m,nf,nv);es['sample_f']=nf;es['sample_v']=nv;es['samples']=[];es['sample_since']=time.time()
      m['reason']=f'Efficiency search — continuing {direction}↓; best averaged J/TH {cj:.2f}'
@@ -272,8 +333,8 @@ async def optimize(mid):
 
   if es.get('phase')=='refine' and len(es.get('samples',[]))>=sample_need and now-es.get('sample_since',now)>=s['settle_seconds']:
    direction=es.get('direction');bf,bv=es['best_f'],es['best_v']
-   if direction=='v': nf=bf;nv=max(s['min_voltage'],bv-es['v_step'])
-   else: nf=max(s['min_frequency'],bf-es['f_step']);nv=bv
+   if direction=='v': nf=bf;nv=max(s['min_voltage'],pf.get('safe_min_v',s['min_voltage']),bv-es['v_step'])
+   else: nf=max(s['min_frequency'],pf.get('safe_min_f',s['min_frequency']),bf-es['f_step']);nv=bv
    if abs(nf-bf)>0.1 or abs(nv-bv)>0.5:
     await set_fv(m,nf,nv);es['phase']='walk';es['sample_f']=nf;es['sample_v']=nv;es['samples']=[];es['sample_since']=time.time()
     m['reason']=f'Efficiency fine probe — {direction}↓ to {nf:.0f} MHz / {nv:.0f} mV'
