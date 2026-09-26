@@ -34,7 +34,7 @@ jobs:
       - name: Build and publish
         uses: docker/build-push-action@v6
         with:
-          context: ./rhenry86-bitaxe-optimizer-github-ready/app
+          context: ./app
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ghcr.io/rhenry86/bitaxe-optimizer:latest
