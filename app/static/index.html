@@ -23,7 +23,10 @@ let scanFound=[];
 function openScan(){scanStatus.textContent='';scanResults.innerHTML='';addFoundBtn.style.display='none';scanDlg.showModal();scanNetwork()}
 function renderScan(r){
  scanFound=r.devices||[];
- renderScan(r);
+ let nets=(r.networks||[]).join(', ');
+ scanStatus.textContent=(scanFound.length?`Found ${scanFound.length} AxeOS device${scanFound.length===1?'':'s'}.`:'No AxeOS devices found.')+(nets?` Scanned ${nets}.`:'');
+ scanResults.innerHTML=scanFound.map((d,i)=>`<div class="row" style="border-top:1px solid #34363b;padding:10px 0"><label style="display:flex;gap:10px;align-items:center;width:100%;font-size:14px"><input class="foundCheck" type="checkbox" data-i="${i}" ${d.added?'disabled':'checked'} style="width:auto;margin:0"><span style="flex:1"><b>${e(d.name)}</b><br><span class="hint">${e(d.host)}${d.model?' · '+e(d.model):''}</span></span><span>${d.hashrate!=null?d.hashrate.toFixed(2)+' TH/s':''}</span><span class="pill ${d.added?'on':''}">${d.added?'ADDED':'FOUND'}</span></label></div>`).join('');
+ addFoundBtn.style.display=scanFound.some(d=>!d.added)?'inline-block':'none';
 }
 async function scanManual(){
  let subnet=manualSubnet.value.trim();if(!subnet)return;
