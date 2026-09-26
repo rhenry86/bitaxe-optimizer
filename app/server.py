@@ -8,18 +8,18 @@ import httpx
 DATA=Path(os.getenv('DATA_DIR','/data')); DATA.mkdir(parents=True,exist_ok=True)
 DB=DATA/'optimizer.db'; app=FastAPI(title='Bitaxe Optimizer'); miners={}; tasks={}
 DEFAULT={
- 'asic_temp_target':60.0,'vr_temp_target':70.0,'fan_target':40.0,'vr_cooling':'shared',
+ 'asic_temp_target':55.0,'vr_temp_target':65.0,'fan_target':65.0,'vr_cooling':'shared',
  'min_frequency':400.0,'max_frequency':600.0,'min_voltage':1000.0,'max_voltage':1150.0,
- 'op_step':0.05,'max_asic_temp':75.0,'max_vr_temp':85.0,'max_error_pct':3.0,'max_reject_pct':1.0,
+ 'op_step':0.05,'max_asic_temp':65.0,'max_vr_temp':75.0,'max_error_pct':3.0,'max_reject_pct':1.0,
  'settle_seconds':30,'temp_deadband':0.5,'vr_temp_deadband':1.0,'fan_deadband':2.0,'recovery_seconds':90,
  'stability_voltage_step':15.0,'stability_probe_seconds':60,'stability_trim_decay':5.0
 }
 class MinerIn(BaseModel): name:str; host:str
 class Settings(BaseModel):
- asic_temp_target:float=Field(60,ge=30,le=85); vr_temp_target:float=Field(70,ge=30,le=110); fan_target:float=Field(40,ge=0,le=100)
+ asic_temp_target:float=Field(55,ge=30,le=85); vr_temp_target:float=Field(65,ge=30,le=110); fan_target:float=Field(65,ge=0,le=100)
  vr_cooling:str='shared'; min_frequency:float=Field(400,gt=0); max_frequency:float=Field(600,gt=0)
  min_voltage:float=Field(1000,gt=0); max_voltage:float=Field(1150,gt=0); op_step:float=Field(.05,gt=0,le=.25)
- max_asic_temp:float=Field(75,ge=30,le=100); max_vr_temp:float=Field(85,ge=30,le=120)
+ max_asic_temp:float=Field(65,ge=30,le=100); max_vr_temp:float=Field(75,ge=30,le=120)
  max_error_pct:float=Field(3,ge=0,le=100); max_reject_pct:float=Field(1,ge=0,le=100)
  settle_seconds:int=Field(30,ge=10,le=600); recovery_seconds:int=Field(90,ge=15,le=1800)
  temp_deadband:float=Field(.5,ge=0,le=10); vr_temp_deadband:float=Field(1,ge=0,le=15); fan_deadband:float=Field(2,ge=0,le=30)
@@ -200,28 +200,39 @@ async def index():return FileResponse(Path(__file__).parent/'static/index.html')
 
 def local_scan_networks():
  nets=[]
- # Resolve all IPv4 addresses visible to the container. Prefer RFC1918 LANs and /24 scans.
+ # Under host networking, these are the Umbrel host's interfaces rather than the app bridge.
  try:
-  infos=socket.getaddrinfo(socket.gethostname(),None,socket.AF_INET,socket.SOCK_STREAM)
-  ips={i[4][0] for i in infos}
- except Exception: ips=set()
- # UDP connect discovers the primary routed IPv4 without sending traffic.
- for target in [('8.8.8.8',80),('1.1.1.1',80)]:
+  import subprocess
+  out=subprocess.check_output(['ip','-4','route','show','scope','link'],text=True,timeout=2)
+  for line in out.splitlines():
+   p=line.split()
+   if not p or '/' not in p[0] or 'dev' not in p: continue
+   dev=p[p.index('dev')+1]
+   if dev.startswith(('lo','docker','br-','veth')): continue
+   try:
+    n=ipaddress.ip_network(p[0],strict=False)
+    if n.version==4 and n.is_private and n.prefixlen>=16:
+     # Keep scanning bounded to the host's local /24 even on a larger LAN.
+     src_ip=None
+     if 'src' in p: src_ip=p[p.index('src')+1]
+     n=ipaddress.ip_network(f'{src_ip}/24',strict=False) if src_ip else n
+     if n.prefixlen<24: continue
+     if n not in nets:nets.append(n)
+   except Exception: pass
+ except Exception: pass
+ # Fallback to interface addresses, still excluding known container bridges.
+ if not nets:
   try:
-   s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(target);ips.add(s.getsockname()[0]);s.close()
-  except Exception: pass
- for raw in ips:
-  try:
-   ip=ipaddress.ip_address(raw)
-   if ip.version==4 and ip.is_private and not ip.is_loopback:
-    n=ipaddress.ip_network(f'{ip}/24',strict=False)
-    if n not in nets:nets.append(n)
+   infos=socket.getaddrinfo(socket.gethostname(),None,socket.AF_INET,socket.SOCK_STREAM)
+   for i in infos:
+    ip=ipaddress.ip_address(i[4][0])
+    if ip.is_private and not ip.is_loopback:
+     n=ipaddress.ip_network(f'{ip}/24',strict=False)
+     if not str(n.network_address).startswith(('10.21.','10.42.')) and n not in nets:nets.append(n)
   except Exception: pass
  return nets
-@app.post('/api/scan')
-async def scan():
- nets=local_scan_networks()
- if not nets: raise HTTPException(503,'Could not determine a private LAN subnet from the Umbrel container. Use Add miner as a fallback.')
+
+async def scan_networks(nets):
  sem=asyncio.Semaphore(48);found=[]
  for net in nets:
   batch=await asyncio.gather(*(probe_ip(str(ip),sem) for ip in net.hosts()))
@@ -230,7 +241,27 @@ async def scan():
  for d in found:
   if d['host'] in seen:continue
   seen.add(d['host']);out.append({**d,'added':clean_host(d['host']) in existing})
- return {'networks':[str(n) for n in nets],'devices':out}
+ return out
+
+@app.post('/api/scan')
+async def scan():
+ nets=local_scan_networks()
+ if not nets: raise HTTPException(503,'Could not determine the Umbrel host LAN automatically. Use Advanced Scan or Add Manually.')
+ return {'networks':[str(n) for n in nets],'devices':await scan_networks(nets)}
+
+class ManualScanIn(BaseModel): subnet:str
+
+@app.post('/api/scan-manual')
+async def scan_manual(x:ManualScanIn):
+ try:
+  raw=x.subnet.strip()
+  if raw.count('.')==2 and '/' not in raw: raw += '.0/24'
+  elif '/' not in raw:
+   ip=ipaddress.ip_address(raw);raw=str(ipaddress.ip_network(f'{ip}/24',strict=False))
+  n=ipaddress.ip_network(raw,strict=False)
+  if n.version!=4 or not n.is_private or n.prefixlen<24: raise ValueError()
+ except Exception: raise HTTPException(400,'Enter a private IPv4 /24, e.g. 192.168.1.0/24')
+ return {'networks':[str(n)],'devices':await scan_networks([n])}
 
 @app.get('/api/miners')
 async def ls():return list(miners.values())

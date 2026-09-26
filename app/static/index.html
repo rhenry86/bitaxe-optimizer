@@ -1,12 +1,12 @@
 <!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Bitaxe Optimizer</title>
 <style>*{box-sizing:border-box}body{margin:0;background:#101114;color:#f4f4f5;font:15px system-ui,-apple-system,sans-serif}main{max-width:1240px;margin:auto;padding:28px}header,.top,.row{display:flex;justify-content:space-between;align-items:center}header{margin-bottom:25px}h1,h2,h3{margin-top:0}.sub,.hint{color:#9699a2}.hint{font-size:12px}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:16px}.card{background:#1a1c20;border:1px solid #303238;border-radius:18px;padding:20px}.pill{padding:5px 9px;border-radius:20px;background:#333;font-size:12px}.on{background:#173b27;color:#8be2ad}.metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:20px 0}.metric b{display:block;font-size:18px}.metric span{color:#999;font-size:11px}.row{padding:5px 0}.reason{color:#aaa;font-size:12px;min-height:32px;margin:15px 0}.actions{display:flex;gap:8px;flex-wrap:wrap}button{border:0;border-radius:10px;padding:10px 14px;font-weight:700;cursor:pointer;background:#f5a623;color:#111}button.dark{background:#303238;color:#eee}dialog{width:min(760px,94vw);max-height:90vh;overflow:auto;background:#1b1c20;color:#eee;border:1px solid #444;border-radius:16px;padding:22px}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px 18px}.full{grid-column:1/-1}label{display:block;color:#b9bbc2;font-size:12px}input,select{display:block;width:100%;margin-top:6px;padding:10px;background:#111;color:#fff;border:1px solid #444;border-radius:8px}.section{border-top:1px solid #34363b;margin-top:18px;padding-top:18px}.section h3{margin-bottom:10px}.dialogactions{display:flex;justify-content:flex-end;gap:8px;margin-top:22px}.danger{color:#ffb4b4}@media(max-width:600px){.formgrid{grid-template-columns:1fr}.metrics{grid-template-columns:repeat(2,1fr)}main{padding:16px}}</style></head>
-<body><main><header><div><h1>Bitaxe Optimizer</h1><div class="sub">Coupled F/V • ASIC + VRM thermal control • error-aware efficiency</div></div><div class="actions"><button class="dark" onclick="openScan()">Scan network</button><button onclick="addDlg.showModal()">+ Add miner</button></div></header><section id="g" class="grid"></section></main>
+<body><main><header><div><h1>Bitaxe Optimizer</h1><div class="sub">Coupled F/V • ASIC + VRM thermal control • error-aware efficiency</div></div><div class="actions"><button class="dark" onclick="openScan()">Scan network</button><button onclick="addDlg.showModal()">+ Add manually</button></div></header><section id="g" class="grid"></section></main>
 <dialog id="addDlg"><h2>Add Bitaxe</h2><label>Name<input id="n" placeholder="NerdQaxe++"></label><label>IP / hostname<input id="h" placeholder="192.168.1.104"></label><div class="dialogactions"><button class="dark" onclick="addDlg.close()">Cancel</button><button onclick="add()">Add</button></div></dialog>
 
 <dialog id="scanDlg"><h2>Scan for Bitaxe miners</h2>
 <div class="hint">Automatically detects the local network available to Umbrel, scans it, and verifies miners through the AxeOS API. Already-added miners are marked automatically.</div>
 <div id="scanStatus" class="hint" style="margin:12px 0"></div><div id="scanResults"></div>
-<div class="dialogactions"><button class="dark" onclick="scanDlg.close()">Close</button><button id="scanBtn" onclick="scanNetwork()">Scan</button><button id="addFoundBtn" onclick="addFound()" style="display:none">Add selected</button></div></dialog>
+<details style="margin-top:12px"><summary>Advanced Scan</summary><label>Subnet<input id="manualSubnet" placeholder="192.168.1.0/24"></label><button class="dark" onclick="scanManual()">Scan this subnet</button></details><div class="dialogactions"><button class="dark" onclick="scanDlg.close()">Close</button><button id="scanBtn" onclick="scanNetwork()">Scan LAN</button><button id="addFoundBtn" onclick="addFound()" style="display:none">Add selected</button></div></dialog>
 
 <dialog id="settingsDlg"><h2 id="settingsTitle">Miner Settings</h2><div class="formgrid">
 <div><label>ASIC temperature target °C<input id="asic_temp_target" type="number" step="0.1"></label></div><div><label>Fan speed target %<input id="fan_target" type="number" step="1"></label></div>
@@ -21,13 +21,20 @@ const api=async(u,o)=>{let r=await fetch(u,o);let j=await r.json().catch(()=>({}
 
 let scanFound=[];
 function openScan(){scanStatus.textContent='';scanResults.innerHTML='';addFoundBtn.style.display='none';scanDlg.showModal();scanNetwork()}
+function renderScan(r){
+ scanFound=r.devices||[];
+ renderScan(r);
+}
+async function scanManual(){
+ let subnet=manualSubnet.value.trim();if(!subnet)return;
+ scanStatus.textContent='Scanning '+subnet+'…';scanResults.innerHTML='';addFoundBtn.style.display='none';
+ try{renderScan(await api('/api/scan-manual',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({subnet})}))}catch(err){scanStatus.textContent=err.message}
+}
 async function scanNetwork(){
  scanBtn.disabled=true;scanStatus.textContent='Detecting local network and scanning for AxeOS miners…';scanResults.innerHTML='';addFoundBtn.style.display='none';
  try{
   let r=await api('/api/scan',{method:'POST'});scanFound=r.devices||[];
-  let nets=(r.networks||[]).join(', ');scanStatus.textContent=(scanFound.length?`Found ${scanFound.length} AxeOS device${scanFound.length===1?'':'s'}.`:'No AxeOS devices found.')+(nets?` Scanned ${nets}.`:'');
-  scanResults.innerHTML=scanFound.map((d,i)=>`<div class="row" style="border-top:1px solid #34363b;padding:10px 0"><label style="display:flex;gap:10px;align-items:center;width:100%;font-size:14px"><input class="foundCheck" type="checkbox" data-i="${i}" ${d.added?'disabled':'checked'} style="width:auto;margin:0"><span style="flex:1"><b>${e(d.name)}</b><br><span class="hint">${e(d.host)}${d.model?' · '+e(d.model):''}</span></span><span>${d.hashrate!=null?d.hashrate.toFixed(2)+' TH/s':''}</span><span class="pill ${d.added?'on':''}">${d.added?'ADDED':'FOUND'}</span></label></div>`).join('');
-  addFoundBtn.style.display=scanFound.some(d=>!d.added)?'inline-block':'none';
+  renderScan(r);
  }catch(err){scanStatus.textContent=err.message}finally{scanBtn.disabled=false}
 }
 async function addFound(){
