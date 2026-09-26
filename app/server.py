@@ -1,4 +1,4 @@
-import asyncio,json,os,sqlite3,time,ipaddress
+import asyncio,json,os,sqlite3,time,ipaddress,socket
 from pathlib import Path
 from fastapi import FastAPI,HTTPException
 from fastapi.responses import FileResponse
@@ -11,10 +11,10 @@ DEFAULT={
  'asic_temp_target':60.0,'vr_temp_target':70.0,'fan_target':40.0,'vr_cooling':'shared',
  'min_frequency':400.0,'max_frequency':600.0,'min_voltage':1000.0,'max_voltage':1150.0,
  'op_step':0.05,'max_asic_temp':75.0,'max_vr_temp':85.0,'max_error_pct':1.0,'max_reject_pct':1.0,
- 'settle_seconds':30,'temp_deadband':0.5,'vr_temp_deadband':1.0,'fan_deadband':2.0,'recovery_seconds':90
+ 'settle_seconds':30,'temp_deadband':0.5,'vr_temp_deadband':1.0,'fan_deadband':2.0,'recovery_seconds':90,
+ 'stability_voltage_step':15.0,'stability_probe_seconds':60,'stability_trim_decay':5.0
 }
 class MinerIn(BaseModel): name:str; host:str
-class ScanIn(BaseModel): subnet:str
 class Settings(BaseModel):
  asic_temp_target:float=Field(60,ge=30,le=85); vr_temp_target:float=Field(70,ge=30,le=110); fan_target:float=Field(40,ge=0,le=100)
  vr_cooling:str='shared'; min_frequency:float=Field(400,gt=0); max_frequency:float=Field(600,gt=0)
@@ -23,6 +23,7 @@ class Settings(BaseModel):
  max_error_pct:float=Field(1,ge=0,le=100); max_reject_pct:float=Field(1,ge=0,le=100)
  settle_seconds:int=Field(30,ge=10,le=600); recovery_seconds:int=Field(90,ge=15,le=1800)
  temp_deadband:float=Field(.5,ge=0,le=10); vr_temp_deadband:float=Field(1,ge=0,le=15); fan_deadband:float=Field(2,ge=0,le=30)
+ stability_voltage_step:float=Field(15,ge=1,le=100); stability_probe_seconds:int=Field(60,ge=15,le=900); stability_trim_decay:float=Field(5,ge=1,le=50)
 
 def merged_settings(raw):
  d=dict(DEFAULT); d.update(raw or {}); return d
@@ -31,7 +32,7 @@ def init():
  c=con();c.execute('CREATE TABLE IF NOT EXISTS miners(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,host TEXT,settings TEXT)')
  c.execute('CREATE TABLE IF NOT EXISTS samples(id INTEGER PRIMARY KEY AUTOINCREMENT,miner_id INTEGER,ts REAL,payload TEXT)')
  for r in c.execute('SELECT * FROM miners'):
-  s=merged_settings(json.loads(r['settings'])); miners[r['id']]={'id':r['id'],'name':r['name'],'host':r['host'],'settings':s,'online':False,'telemetry':{},'reason':'Idle','mode':'paused','recovery_since':None,'last_shares':None}
+  s=merged_settings(json.loads(r['settings'])); miners[r['id']]={'id':r['id'],'name':r['name'],'host':r['host'],'settings':s,'online':False,'telemetry':{},'reason':'Idle','mode':'paused','recovery_since':None,'last_shares':None,'stability_trim':0.0,'stable_since':None}
   c.execute('UPDATE miners SET settings=? WHERE id=?',(json.dumps(s),r['id']))
  c.commit();c.close()
 def base(host):
@@ -83,8 +84,11 @@ def target_score(t,s):
  if t.get('fan') is not None: vals.append(abs(t['fan']-s['fan_target'])/20)
  if t.get('vr_temp') is not None: vals.append(abs(t['vr_temp']-s['vr_temp_target'])/max(1,s['vr_temp_target']*.12))
  return sum(vals)/len(vals) if vals else 1e9
+async def set_fv(m,f,v):
+ s=m['settings'];f=round(max(s['min_frequency'],min(s['max_frequency'],f)));v=round(max(s['min_voltage'],min(s['max_voltage'],v)))
+ await patch(m['host'],{'overclockEnabled':1,'frequency':f,'coreVoltage':v});return f,v
 async def set_op(m,x):
- f,v=op_to_fv(x,m['settings']);await patch(m['host'],{'overclockEnabled':1,'frequency':f,'coreVoltage':v});return f,v
+ f,v=op_to_fv(x,m['settings']);trim=max(0,m.get('stability_trim',0));return await set_fv(m,f,min(m['settings']['max_voltage'],v+trim))
 async def auto_fan(m,on=True): await patch(m['host'],{'autofanspeed':1 if on else 0})
 async def poll(mid):
  while mid in miners:
@@ -103,7 +107,20 @@ async def optimize(mid):
   if hard_hot(t,s):
    await set_op(m,0);await auto_fan(m,True);m['mode']='autofan';m['recovery_since']=None;m['reason']='Hard thermal limit — minimum F/V + AxeOS Auto Fan';await asyncio.sleep(s['settle_seconds']);continue
   if not stable(t,s):
-   nx=max(0,x-s['op_step']);await set_op(m,nx);m['recovery_since']=None;m['reason']=f'Error/reject guard — coupled F/V ↓ to {nx*100:.0f}%';await asyncio.sleep(s['settle_seconds']);continue
+   # Stability faults are usually insufficient voltage for the selected frequency.
+   # Hold frequency and add voltage first; only reduce frequency when max voltage is reached.
+   f=t.get('frequency') if t.get('frequency') is not None else op_to_fv(x,s)[0]
+   v=t.get('voltage') if t.get('voltage') is not None else op_to_fv(x,s)[1]
+   step=s['stability_voltage_step'];m['stable_since']=None;m['recovery_since']=None
+   if v < s['max_voltage']-0.5:
+    nv=min(s['max_voltage'],v+step);m['stability_trim']=max(m.get('stability_trim',0),nv-op_to_fv(x,s)[1])
+    await set_fv(m,f,nv);m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
+   nx=max(0,x-s['op_step']);nf,_=op_to_fv(nx,s);await set_fv(m,nf,s['max_voltage']);m['stability_trim']=max(0,s['max_voltage']-op_to_fv(nx,s)[1]);m['reason']=f'Max voltage still unstable — frequency ↓ to {nf:.0f} MHz, holding {s["max_voltage"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+  # Once stable, retain learned voltage trim. Probe it downward only after a sustained stable period.
+  if m.get('stability_trim',0)>0:
+   if m.get('stable_since') is None:m['stable_since']=time.time()
+   if time.time()-m['stable_since']>=s['stability_probe_seconds']:
+    oldtrim=m['stability_trim'];m['stability_trim']=max(0,oldtrim-s['stability_trim_decay']);f,bv=op_to_fv(x,s);nv=min(s['max_voltage'],bv+m['stability_trim']);await set_fv(m,f,nv);m['stable_since']=time.time();m['reason']=f'Stable — cautiously probing voltage trim down to +{m["stability_trim"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
   # Shared cooling: either ASIC or VRM can trigger AxeOS fan takeover at minimum. Separate/passive VRM cannot be independently commanded by current AxeOS API.
   at_min=x<=0.01
   need_takeover=at_min and (asic_hot or (vr_hot and s['vr_cooling']=='shared'))
@@ -163,29 +180,46 @@ async def startup():
 @app.get('/')
 async def index():return FileResponse(Path(__file__).parent/'static/index.html')
 
-@app.post('/api/scan')
-async def scan(x:ScanIn):
- raw=x.subnet.strip()
+def local_scan_networks():
+ nets=[]
+ # Resolve all IPv4 addresses visible to the container. Prefer RFC1918 LANs and /24 scans.
  try:
-  # Accept 192.168.1, 192.168.1.0/24, or a single LAN IP.
-  if raw.count('.')==2 and '/' not in raw: raw += '.0/24'
-  elif '/' not in raw:
-   ip=ipaddress.ip_address(raw); raw=str(ipaddress.ip_network(f'{ip}/24',strict=False))
-  net=ipaddress.ip_network(raw,strict=False)
-  if net.version!=4 or net.prefixlen<24: raise ValueError()
-  if not net.is_private: raise ValueError()
- except Exception: raise HTTPException(400,'Enter a private IPv4 /24, e.g. 192.168.1.0/24')
- sem=asyncio.Semaphore(48)
- found=await asyncio.gather(*(probe_ip(str(ip),sem) for ip in net.hosts()))
- existing={clean_host(m['host']) for m in miners.values()}
- return [{**d,'added':clean_host(d['host']) in existing} for d in found if d]
+  infos=socket.getaddrinfo(socket.gethostname(),None,socket.AF_INET,socket.SOCK_STREAM)
+  ips={i[4][0] for i in infos}
+ except Exception: ips=set()
+ # UDP connect discovers the primary routed IPv4 without sending traffic.
+ for target in [('8.8.8.8',80),('1.1.1.1',80)]:
+  try:
+   s=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);s.connect(target);ips.add(s.getsockname()[0]);s.close()
+  except Exception: pass
+ for raw in ips:
+  try:
+   ip=ipaddress.ip_address(raw)
+   if ip.version==4 and ip.is_private and not ip.is_loopback:
+    n=ipaddress.ip_network(f'{ip}/24',strict=False)
+    if n not in nets:nets.append(n)
+  except Exception: pass
+ return nets
+@app.post('/api/scan')
+async def scan():
+ nets=local_scan_networks()
+ if not nets: raise HTTPException(503,'Could not determine a private LAN subnet from the Umbrel container. Use Add miner as a fallback.')
+ sem=asyncio.Semaphore(48);found=[]
+ for net in nets:
+  batch=await asyncio.gather(*(probe_ip(str(ip),sem) for ip in net.hosts()))
+  found.extend(d for d in batch if d)
+ existing={clean_host(m['host']) for m in miners.values()};seen=set();out=[]
+ for d in found:
+  if d['host'] in seen:continue
+  seen.add(d['host']);out.append({**d,'added':clean_host(d['host']) in existing})
+ return {'networks':[str(n) for n in nets],'devices':out}
 
 @app.get('/api/miners')
 async def ls():return list(miners.values())
 @app.post('/api/miners')
 async def add(x:MinerIn):
  c=con();q=c.execute('INSERT INTO miners(name,host,settings) VALUES(?,?,?)',(x.name,x.host,json.dumps(DEFAULT)));mid=q.lastrowid;c.commit();c.close()
- miners[mid]={'id':mid,'name':x.name,'host':x.host,'settings':dict(DEFAULT),'online':False,'telemetry':{},'reason':'Starting telemetry','mode':'paused','recovery_since':None,'last_shares':None};asyncio.create_task(poll(mid));return miners[mid]
+ miners[mid]={'id':mid,'name':x.name,'host':x.host,'settings':dict(DEFAULT),'online':False,'telemetry':{},'reason':'Starting telemetry','mode':'paused','recovery_since':None,'last_shares':None,'stability_trim':0.0,'stable_since':None};asyncio.create_task(poll(mid));return miners[mid]
 @app.delete('/api/miners/{mid}')
 async def rem(mid:int):
  if mid not in miners:raise HTTPException(404)
