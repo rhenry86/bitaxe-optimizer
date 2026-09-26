@@ -1,13 +1,14 @@
 from datetime import datetime, timezone
-import asyncio
-import csv, io
-from collections import deque,json,os,sqlite3,time,ipaddress,socket
+import asyncio,json,os,sqlite3,time,ipaddress,socket
 from pathlib import Path
 from fastapi import FastAPI,HTTPException
-from fastapi.responses import StreamingResponse
 from fastapi.responses import FileResponse
 from pydantic import BaseModel,Field
 import httpx
+import csv
+import io
+from collections import deque
+from fastapi.responses import StreamingResponse
 
 DATA=Path(os.getenv('DATA_DIR','/data')); DATA.mkdir(parents=True,exist_ok=True)
 DB=DATA/'optimizer.db'; app=FastAPI(title='Bitaxe Optimizer'); miners={}; tasks={}
@@ -84,26 +85,27 @@ def demands(t,s):
  return asic,vr,fan,cool_asic,cool_vr,fan_low
 optimizer_history=deque(maxlen=20000)
 
-def record_optimizer_snapshot(m, action='telemetry'):
+def record_optimizer_snapshot(m):
  t=m.get('telemetry') or {}; st=m.get('settings') or {}
  optimizer_history.append({
   'timestamp':datetime.now(timezone.utc).isoformat(),
-  'miner_name':m.get('name',''),'host':m.get('host',''),'action':action,
-  'reason':m.get('reason',''),'asic_temp_c':t.get('temp'),'vrm_temp_c':t.get('vr_temp'),
-  'fan_pct':t.get('fan'),'hashrate_ths':t.get('hashrate'),'power_w':t.get('power'),
-  'j_th':t.get('jth'),'hw_error_pct':t.get('error_pct'),'reject_pct':t.get('reject_pct'),
-  'frequency_mhz':t.get('frequency'),'core_voltage_mv':t.get('core_voltage'),
+  'miner_name':m.get('name',''),'host':m.get('host',''),'reason':m.get('reason',''),
+  'asic_temp_c':t.get('temp'),'vrm_temp_c':t.get('vr_temp'),'fan_pct':t.get('fan'),
+  'hashrate_ths':t.get('hashrate'),'power_w':t.get('power'),'j_th':t.get('jth'),
+  'hw_error_pct':t.get('error_pct'),'reject_pct':t.get('reject_pct'),
+  'frequency_mhz':t.get('frequency'),'core_voltage_mv':t.get('voltage'),
   'asic_target_c':st.get('asic_temp_target'),'vrm_target_c':st.get('vr_temp_target'),
   'fan_target_pct':st.get('fan_target')
  })
 
 @app.get('/api/optimizer-log.csv')
 async def optimizer_log_csv():
- fields=['timestamp','miner_name','host','action','reason','asic_temp_c','vrm_temp_c','fan_pct',
+ fields=['timestamp','miner_name','host','reason','asic_temp_c','vrm_temp_c','fan_pct',
  'hashrate_ths','power_w','j_th','hw_error_pct','reject_pct','frequency_mhz','core_voltage_mv',
  'asic_target_c','vrm_target_c','fan_target_pct']
- out=io.StringIO(); w=csv.DictWriter(out,fieldnames=fields); w.writeheader()
- for row in optimizer_history:w.writerow(row)
+ out=io.StringIO()
+ writer=csv.DictWriter(out,fieldnames=fields); writer.writeheader()
+ writer.writerows(list(optimizer_history))
  return StreamingResponse(iter([out.getvalue()]),media_type='text/csv',
   headers={'Content-Disposition':'attachment; filename="bitaxe-optimizer-log.csv"'})
 
@@ -128,7 +130,7 @@ async def poll(mid):
  while mid in miners:
   m=miners[mid]
   try:
-   t=norm(await getj(m['host'],'/api/system/info'),m);m['telemetry']=t;m['online']=True
+   t=norm(await getj(m['host'],'/api/system/info'),m);m['telemetry']=t;m['online']=True;record_optimizer_snapshot(m)
    c=con();c.execute('INSERT INTO samples(miner_id,ts,payload) VALUES(?,?,?)',(mid,time.time(),json.dumps(t)));c.commit();c.close()
   except Exception:m['online']=False
   await asyncio.sleep(5)
