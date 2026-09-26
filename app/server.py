@@ -1,4 +1,4 @@
-import asyncio,json,os,sqlite3,time
+import asyncio,json,os,sqlite3,time,ipaddress
 from pathlib import Path
 from fastapi import FastAPI,HTTPException
 from fastapi.responses import FileResponse
@@ -14,6 +14,7 @@ DEFAULT={
  'settle_seconds':30,'temp_deadband':0.5,'vr_temp_deadband':1.0,'fan_deadband':2.0,'recovery_seconds':90
 }
 class MinerIn(BaseModel): name:str; host:str
+class ScanIn(BaseModel): subnet:str
 class Settings(BaseModel):
  asic_temp_target:float=Field(60,ge=30,le=85); vr_temp_target:float=Field(70,ge=30,le=110); fan_target:float=Field(40,ge=0,le=100)
  vr_cooling:str='shared'; min_frequency:float=Field(400,gt=0); max_frequency:float=Field(600,gt=0)
@@ -132,12 +133,53 @@ async def optimize(mid):
    await set_op(m,x);m['reason']='Probe rejected — restored prior stable point'
   else:m['reason']='Holding stable operating point'
   await asyncio.sleep(s['settle_seconds'])
+
+def clean_host(host):
+ return host.replace('http://','').replace('https://','').split('/')[0].split(':')[0]
+def discovered_name(d,ip):
+ for k in ('hostname','hostName','deviceName','name'):
+  v=d.get(k)
+  if isinstance(v,str) and v.strip(): return v.strip()
+ model=d.get('deviceModel') or d.get('boardVersion') or d.get('ASICModel')
+ return f'{model} ({ip})' if model else f'Bitaxe {ip.split(".")[-1]}'
+async def probe_ip(ip,sem):
+ async with sem:
+  try:
+   async with httpx.AsyncClient(timeout=httpx.Timeout(1.2,connect=.45)) as x:
+    r=await x.get(f'http://{ip}/api/system/info')
+    if r.status_code!=200:return None
+    d=r.json()
+    # Require AxeOS-like telemetry so random web devices are not offered.
+    if not any(k in d for k in ('hashRate','hashRate_1m','ASICModel','frequency','coreVoltage')):return None
+    t=norm(d)
+    return {'host':ip,'name':discovered_name(d,ip),'model':d.get('deviceModel') or d.get('ASICModel') or d.get('boardVersion'),
+            'hashrate':t.get('hashrate'),'temp':t.get('temp'),'power':t.get('power')}
+  except Exception:return None
+
 @app.on_event('startup')
 async def startup():
  init()
  for mid in list(miners):asyncio.create_task(poll(mid))
 @app.get('/')
 async def index():return FileResponse(Path(__file__).parent/'static/index.html')
+
+@app.post('/api/scan')
+async def scan(x:ScanIn):
+ raw=x.subnet.strip()
+ try:
+  # Accept 192.168.1, 192.168.1.0/24, or a single LAN IP.
+  if raw.count('.')==2 and '/' not in raw: raw += '.0/24'
+  elif '/' not in raw:
+   ip=ipaddress.ip_address(raw); raw=str(ipaddress.ip_network(f'{ip}/24',strict=False))
+  net=ipaddress.ip_network(raw,strict=False)
+  if net.version!=4 or net.prefixlen<24: raise ValueError()
+  if not net.is_private: raise ValueError()
+ except Exception: raise HTTPException(400,'Enter a private IPv4 /24, e.g. 192.168.1.0/24')
+ sem=asyncio.Semaphore(48)
+ found=await asyncio.gather(*(probe_ip(str(ip),sem) for ip in net.hosts()))
+ existing={clean_host(m['host']) for m in miners.values()}
+ return [{**d,'added':clean_host(d['host']) in existing} for d in found if d]
+
 @app.get('/api/miners')
 async def ls():return list(miners.values())
 @app.post('/api/miners')
