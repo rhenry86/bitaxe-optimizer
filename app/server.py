@@ -1,7 +1,8 @@
+from datetime import datetime, timezone
 import asyncio,json,os,sqlite3,time,ipaddress,socket
 from pathlib import Path
 from fastapi import FastAPI,HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import StreamingResponse, FileResponse
 from pydantic import BaseModel,Field
 import httpx
 
@@ -77,7 +78,50 @@ def demands(t,s):
  cool_asic=t.get('temp') is not None and t['temp']<s['asic_temp_target']-s['temp_deadband']
  cool_vr=t.get('vr_temp') is None or t['vr_temp']<s['vr_temp_target']-s['vr_temp_deadband']
  fan_low=t.get('fan') is not None and t['fan']<s['fan_target']-s['fan_deadband']
- return asic,vr,fan,cool_asic,cool_vr,fan_low
+ returoptimizer_history=deque(maxlen=20000)
+
+def log_optimizer_event(m, action, before=None, after=None):
+ """Record enough state to audit every optimizer decision without growing forever."""
+ t=m.get('telemetry') or {}
+ st=m.get('settings') or {}
+ row={
+  'timestamp':datetime.now(timezone.utc).isoformat(),
+  'miner_id':m.get('id',''),'miner_name':m.get('name',''),'host':m.get('host',''),
+  'action':action,'reason':m.get('reason',''),
+  'asic_temp_c':t.get('temp'),'vrm_temp_c':t.get('vr_temp'),'fan_pct':t.get('fan'),
+  'hashrate_ths':t.get('hashrate'),'power_w':t.get('power'),'j_th':t.get('jth'),
+  'hw_error_pct':t.get('error_pct'),'reject_pct':t.get('reject_pct'),
+  'frequency_mhz':t.get('frequency'),'core_voltage_mv':t.get('core_voltage'),
+  'auto_fan':t.get('autofanspeed'),
+  'asic_target_c':st.get('asic_temp_target'),'vrm_target_c':st.get('vr_temp_target'),
+  'fan_target_pct':st.get('fan_target'),'max_hw_error_pct':st.get('max_error_pct'),
+  'max_reject_pct':st.get('max_reject_pct'),
+  'before_operating_point':before,'after_operating_point':after
+ }
+ optimizer_history.append(row)
+
+@app.get('/api/optimizer-log')
+async def optimizer_log():
+ return {'events':list(optimizer_history)}
+
+@app.get('/api/optimizer-log.csv')
+async def optimizer_log_csv():
+ rows=list(optimizer_history)
+ fields=['timestamp','miner_id','miner_name','host','action','reason','asic_temp_c','vrm_temp_c',
+         'fan_pct','hashrate_ths','power_w','j_th','hw_error_pct','reject_pct','frequency_mhz',
+         'core_voltage_mv','auto_fan','asic_target_c','vrm_target_c','fan_target_pct',
+         'max_hw_error_pct','max_reject_pct','before_operating_point','after_operating_point']
+ out=io.StringIO();w=csv.DictWriter(out,fieldnames=fields);w.writeheader();w.writerows(rows)
+ data=out.getvalue()
+ return StreamingResponse(iter([data]),media_type='text/csv',
+  headers={'Content-Disposition':'attachment; filename="bitaxe-optimizer-log.csv"'})
+
+@app.delete('/api/optimizer-log')
+async def clear_optimizer_log():
+ optimizer_history.clear()
+ return {'ok':True}
+
+n asic,vr,fan,cool_asic,cool_vr,fan_low
 def target_score(t,s):
  # ASIC temperature and fan utilization are equal optimization objectives.
  # Values inside their configured deadbands count as on-target (zero penalty).
@@ -108,9 +152,11 @@ async def optimize(mid):
  while mid in miners:
   s=m['settings'];t=m.get('telemetry',{})
   if not m.get('online') or not t:m['reason']='Waiting for telemetry';await asyncio.sleep(5);continue
+  log_optimizer_event(m, 'optimizer_decision')
   x=fv_to_op(t.get('frequency'),t.get('voltage'),s);asic_hot,vr_hot,fan_high,cool_asic,cool_vr,fan_low=demands(t,s)
   if hard_hot(t,s):
    await set_op(m,0);await auto_fan(m,True);m['mode']='autofan';m['recovery_since']=None;m['reason']='Hard thermal limit — minimum F/V + AxeOS Auto Fan';await asyncio.sleep(s['settle_seconds']);continue
+   log_optimizer_event(m, 'optimizer_decision')
   if not stable(t,s):
    # Stability faults are usually insufficient voltage for the selected frequency.
    # Hold frequency and add voltage first; only reduce frequency when max voltage is reached.
@@ -120,36 +166,47 @@ async def optimize(mid):
    if v < s['max_voltage']-0.5:
     nv=min(s['max_voltage'],v+step);m['stability_trim']=max(m.get('stability_trim',0),nv-op_to_fv(x,s)[1])
     await set_fv(m,f,nv);m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
+    log_optimizer_event(m, 'optimizer_decision')
    nx=max(0,x-s['op_step']);nf,_=op_to_fv(nx,s);await set_fv(m,nf,s['max_voltage']);m['stability_trim']=max(0,s['max_voltage']-op_to_fv(nx,s)[1]);m['reason']=f'Max voltage still unstable — frequency ↓ to {nf:.0f} MHz, holding {s["max_voltage"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+   log_optimizer_event(m, 'optimizer_decision')
   # Once stable, retain learned voltage trim. Probe it downward only after a sustained stable period.
   if m.get('stability_trim',0)>0:
    if m.get('stable_since') is None:m['stable_since']=time.time()
    if time.time()-m['stable_since']>=s['stability_probe_seconds']:
     oldtrim=m['stability_trim'];m['stability_trim']=max(0,oldtrim-s['stability_trim_decay']);f,bv=op_to_fv(x,s);nv=min(s['max_voltage'],bv+m['stability_trim']);await set_fv(m,f,nv);m['stable_since']=time.time();m['reason']=f'Stable — cautiously probing voltage trim down to +{m["stability_trim"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+    log_optimizer_event(m, 'optimizer_decision')
   # Shared cooling: either ASIC or VRM can trigger AxeOS fan takeover at minimum. Separate/passive VRM cannot be independently commanded by current AxeOS API.
   at_min=x<=0.01
   need_takeover=at_min and (asic_hot or (vr_hot and s['vr_cooling']=='shared'))
   if need_takeover:
    await set_op(m,0);await auto_fan(m,True);m['mode']='autofan';m['recovery_since']=None;m['reason']='Minimum F/V; shared thermal demand handed to AxeOS Auto Fan';await asyncio.sleep(s['settle_seconds']);continue
+   log_optimizer_event(m, 'optimizer_decision')
   if at_min and vr_hot and s['vr_cooling'] in ('separate','passive'):
    m['mode']='vr_guard';m['reason']='VRM above target at minimum F/V — holding minimum; independent VR fan control is not exposed by AxeOS';await asyncio.sleep(s['settle_seconds']);continue
+   log_optimizer_event(m, 'optimizer_decision')
   if m['mode'] in ('autofan','vr_guard'):
    recovered=cool_asic and cool_vr and (fan_low if s['vr_cooling']=='shared' else True)
    if not recovered:
     m['recovery_since']=None;m['reason']='Thermal recovery — holding minimum F/V';await asyncio.sleep(s['settle_seconds']);continue
+    log_optimizer_event(m, 'optimizer_decision')
    if m.get('recovery_since') is None:m['recovery_since']=time.time()
    elapsed=time.time()-m['recovery_since']
    if elapsed<s['recovery_seconds']:
     m['reason']=f'Stable recovery {elapsed:.0f}/{s["recovery_seconds"]}s — holding minimum F/V';await asyncio.sleep(min(s['settle_seconds'],15));continue
+    log_optimizer_event(m, 'optimizer_decision')
    m['mode']='optimizing';m['recovery_since']=None;m['reason']='Thermally recovered — resuming slow coupled F/V optimization'
+   log_optimizer_event(m, 'optimizer_decision')
   # Any target demand retreats F/V. Fan target matters in normal operation; VR target always protects VRM.
   if asic_hot or vr_hot or fan_high:
    nx=max(0,x-s['op_step']);await set_op(m,nx);m['reason']=f'Thermal/fan demand — coupled F/V ↓ to {nx*100:.0f}%';await asyncio.sleep(s['settle_seconds']);continue
+   log_optimizer_event(m, 'optimizer_decision')
   if (not asic_hot) and (not vr_hot) and fan_low:
    nx=min(1,x+s['op_step']);await set_op(m,nx);m['reason']=f'Fan headroom available — coupled F/V ↑ to {nx*100:.0f}% (fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target)';await asyncio.sleep(s['settle_seconds']);continue
+   log_optimizer_event(m, 'optimizer_decision')
   base_j=t.get('jth')
   if base_j and x<1:
    nx=min(1,x+s['op_step']);await set_op(m,nx);m['reason']=f'Efficiency probe at {nx*100:.0f}% coupled F/V';await asyncio.sleep(s['settle_seconds'])
+   log_optimizer_event(m, 'optimizer_decision')
    tt=m.get('telemetry',{})
    oldscore=target_score(t,s);newscore=target_score(tt,s)
    efficient=tt.get('jth') is not None and tt['jth']<base_j*.995
@@ -159,14 +216,21 @@ async def optimize(mid):
    if stable(tt,s) and safe_target and (target_improved or (efficient and newscore<=oldscore+.05)):
     why='target balance improved' if target_improved else f'efficiency improved to {tt["jth"]:.2f} J/TH'
     m['reason']=f'Probe kept — {why}';continue
+    log_optimizer_event(m, 'optimizer_decision')
    await set_op(m,x)
    if not stable(tt,s):
     m['reason']=f'Probe rejected: stability limit (HW {tt.get("error_pct",0):.2f}% / reject {tt.get("reject_pct",0):.2f}%)'
+    log_optimizer_event(m, 'optimizer_decision')
    elif tt_vr_hot:m['reason']=f'Probe rejected: VRM exceeded target band ({tt.get("vr_temp",0):.1f}°C)'
+   log_optimizer_event(m, 'optimizer_decision')
    elif tt_asic_hot:m['reason']=f'Probe rejected: ASIC exceeded target band ({tt.get("temp",0):.1f}°C)'
+   log_optimizer_event(m, 'optimizer_decision')
    elif not efficient and not target_improved:m['reason']='Probe rejected: no target-balance or J/TH improvement'
+   log_optimizer_event(m, 'optimizer_decision')
    else:m['reason']='Probe rejected — restored prior stable point'
+   log_optimizer_event(m, 'optimizer_decision')
   else:m['reason']='Holding stable operating point'
+  log_optimizer_event(m, 'optimizer_decision')
   await asyncio.sleep(s['settle_seconds'])
 
 def clean_host(host):
@@ -199,37 +263,39 @@ async def startup():
 async def index():return FileResponse(Path(__file__).parent/'static/index.html')
 
 def local_scan_networks():
+ """Return likely LAN /24s. AxeOS probing decides which candidate is actually useful."""
  nets=[]
- # Under host networking, these are the Umbrel host's interfaces rather than the app bridge.
+ def add(raw):
+  try:
+   n=ipaddress.ip_network(raw,strict=False)
+   if n.version==4 and n.is_private and n.prefixlen==24 and n not in nets:nets.append(n)
+  except Exception: pass
+
+ # Try Linux routes first.
  try:
   import subprocess
-  out=subprocess.check_output(['ip','-4','route','show','scope','link'],text=True,timeout=2)
+  out=subprocess.check_output(['ip','-4','route'],text=True,timeout=2)
   for line in out.splitlines():
    p=line.split()
-   if not p or '/' not in p[0] or 'dev' not in p: continue
-   dev=p[p.index('dev')+1]
-   if dev.startswith(('lo','docker','br-','veth')): continue
-   try:
-    n=ipaddress.ip_network(p[0],strict=False)
-    if n.version==4 and n.is_private and n.prefixlen>=16:
-     # Keep scanning bounded to the host's local /24 even on a larger LAN.
-     src_ip=None
-     if 'src' in p: src_ip=p[p.index('src')+1]
-     n=ipaddress.ip_network(f'{src_ip}/24',strict=False) if src_ip else n
-     if n.prefixlen<24: continue
-     if n not in nets:nets.append(n)
-   except Exception: pass
+   if 'src' in p:
+    ip=p[p.index('src')+1]
+    if not ip.startswith(('10.21.','10.42.','172.17.','172.18.','172.19.','172.20.')):
+     add(f'{ip}/24')
  except Exception: pass
- # Fallback to interface addresses, still excluding known container bridges.
- if not nets:
-  try:
-   infos=socket.getaddrinfo(socket.gethostname(),None,socket.AF_INET,socket.SOCK_STREAM)
-   for i in infos:
-    ip=ipaddress.ip_address(i[4][0])
-    if ip.is_private and not ip.is_loopback:
-     n=ipaddress.ip_network(f'{ip}/24',strict=False)
-     if not str(n.network_address).startswith(('10.21.','10.42.')) and n not in nets:nets.append(n)
-  except Exception: pass
+
+ # Try hostname/interface addresses.
+ try:
+  for info in socket.getaddrinfo(socket.gethostname(),None,socket.AF_INET,socket.SOCK_STREAM):
+   ip=info[4][0]
+   if ipaddress.ip_address(ip).is_private and not ip.startswith(('10.21.','10.42.','172.17.','172.18.','172.19.','172.20.')):
+    add(f'{ip}/24')
+ except Exception: pass
+
+ # Common home LANs. These are verified by AxeOS probes before being reported.
+ # 192.168.1.x is intentionally first because it is the most common and is
+ # confirmed working with this app's Advanced Scan.
+ for raw in ('192.168.1.0/24','192.168.0.0/24','192.168.50.0/24','192.168.68.0/24','192.168.86.0/24'):
+  add(raw)
  return nets
 
 async def scan_networks(nets):
@@ -246,8 +312,11 @@ async def scan_networks(nets):
 @app.post('/api/scan')
 async def scan():
  nets=local_scan_networks()
- if not nets: raise HTTPException(503,'Could not determine the Umbrel host LAN automatically. Use Advanced Scan or Add Manually.')
- return {'networks':[str(n) for n in nets],'devices':await scan_networks(nets)}
+ for n in nets:
+  devices=await scan_networks([n])
+  if devices:
+   return {'networks':[str(n)],'devices':devices}
+ return {'networks':[str(n) for n in nets],'devices':[]}
 
 class ManualScanIn(BaseModel): subnet:str
 
