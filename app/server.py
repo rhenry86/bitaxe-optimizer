@@ -10,7 +10,7 @@ DB=DATA/'optimizer.db'; app=FastAPI(title='Bitaxe Optimizer'); miners={}; tasks=
 DEFAULT={
  'asic_temp_target':60.0,'vr_temp_target':70.0,'fan_target':40.0,'vr_cooling':'shared',
  'min_frequency':400.0,'max_frequency':600.0,'min_voltage':1000.0,'max_voltage':1150.0,
- 'op_step':0.05,'max_asic_temp':75.0,'max_vr_temp':85.0,'max_error_pct':1.0,'max_reject_pct':1.0,
+ 'op_step':0.05,'max_asic_temp':75.0,'max_vr_temp':85.0,'max_error_pct':3.0,'max_reject_pct':1.0,
  'settle_seconds':30,'temp_deadband':0.5,'vr_temp_deadband':1.0,'fan_deadband':2.0,'recovery_seconds':90,
  'stability_voltage_step':15.0,'stability_probe_seconds':60,'stability_trim_decay':5.0
 }
@@ -20,7 +20,7 @@ class Settings(BaseModel):
  vr_cooling:str='shared'; min_frequency:float=Field(400,gt=0); max_frequency:float=Field(600,gt=0)
  min_voltage:float=Field(1000,gt=0); max_voltage:float=Field(1150,gt=0); op_step:float=Field(.05,gt=0,le=.25)
  max_asic_temp:float=Field(75,ge=30,le=100); max_vr_temp:float=Field(85,ge=30,le=120)
- max_error_pct:float=Field(1,ge=0,le=100); max_reject_pct:float=Field(1,ge=0,le=100)
+ max_error_pct:float=Field(3,ge=0,le=100); max_reject_pct:float=Field(1,ge=0,le=100)
  settle_seconds:int=Field(30,ge=10,le=600); recovery_seconds:int=Field(90,ge=15,le=1800)
  temp_deadband:float=Field(.5,ge=0,le=10); vr_temp_deadband:float=Field(1,ge=0,le=15); fan_deadband:float=Field(2,ge=0,le=30)
  stability_voltage_step:float=Field(15,ge=1,le=100); stability_probe_seconds:int=Field(60,ge=15,le=900); stability_trim_decay:float=Field(5,ge=1,le=50)
@@ -79,10 +79,15 @@ def demands(t,s):
  fan_low=t.get('fan') is not None and t['fan']<s['fan_target']-s['fan_deadband']
  return asic,vr,fan,cool_asic,cool_vr,fan_low
 def target_score(t,s):
+ # ASIC temperature and fan utilization are equal optimization objectives.
+ # Values inside their configured deadbands count as on-target (zero penalty).
  vals=[]
- if t.get('temp') is not None: vals.append(abs(t['temp']-s['asic_temp_target'])/max(1,s['asic_temp_target']*.10))
- if t.get('fan') is not None: vals.append(abs(t['fan']-s['fan_target'])/20)
- if t.get('vr_temp') is not None: vals.append(abs(t['vr_temp']-s['vr_temp_target'])/max(1,s['vr_temp_target']*.12))
+ if t.get('temp') is not None:
+  e=max(0,abs(t['temp']-s['asic_temp_target'])-s['temp_deadband'])
+  vals.append(e/max(1,s['asic_temp_target']*.10))
+ if t.get('fan') is not None:
+  e=max(0,abs(t['fan']-s['fan_target'])-s['fan_deadband'])
+  vals.append(e/20.0)
  return sum(vals)/len(vals) if vals else 1e9
 async def set_fv(m,f,v):
  s=m['settings'];f=round(max(s['min_frequency'],min(s['max_frequency'],f)));v=round(max(s['min_voltage'],min(s['max_voltage'],v)))
@@ -140,14 +145,27 @@ async def optimize(mid):
   # Any target demand retreats F/V. Fan target matters in normal operation; VR target always protects VRM.
   if asic_hot or vr_hot or fan_high:
    nx=max(0,x-s['op_step']);await set_op(m,nx);m['reason']=f'Thermal/fan demand — coupled F/V ↓ to {nx*100:.0f}%';await asyncio.sleep(s['settle_seconds']);continue
-  if cool_asic and cool_vr and fan_low:
-   nx=min(1,x+s['op_step']);await set_op(m,nx);m['reason']=f'Headroom available — coupled F/V ↑ to {nx*100:.0f}%';await asyncio.sleep(s['settle_seconds']);continue
+  if (not asic_hot) and (not vr_hot) and fan_low:
+   nx=min(1,x+s['op_step']);await set_op(m,nx);m['reason']=f'Fan headroom available — coupled F/V ↑ to {nx*100:.0f}% (fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target)';await asyncio.sleep(s['settle_seconds']);continue
   base_j=t.get('jth')
   if base_j and x<1:
    nx=min(1,x+s['op_step']);await set_op(m,nx);m['reason']=f'Efficiency probe at {nx*100:.0f}% coupled F/V';await asyncio.sleep(s['settle_seconds'])
-   tt=m.get('telemetry',{});ok=target_score(tt,s)<=target_score(t,s)+.08;efficient=tt.get('jth') is not None and tt['jth']<base_j*.995
-   if stable(tt,s) and ok and efficient:m['reason']=f'Kept efficient point: {tt["jth"]:.2f} J/TH';continue
-   await set_op(m,x);m['reason']='Probe rejected — restored prior stable point'
+   tt=m.get('telemetry',{})
+   oldscore=target_score(t,s);newscore=target_score(tt,s)
+   efficient=tt.get('jth') is not None and tt['jth']<base_j*.995
+   target_improved=newscore<oldscore-.01
+   tt_asic_hot,tt_vr_hot,tt_fan_high,_,_,_=demands(tt,s)
+   safe_target=(not tt_asic_hot) and (not tt_vr_hot)
+   if stable(tt,s) and safe_target and (target_improved or (efficient and newscore<=oldscore+.05)):
+    why='target balance improved' if target_improved else f'efficiency improved to {tt["jth"]:.2f} J/TH'
+    m['reason']=f'Probe kept — {why}';continue
+   await set_op(m,x)
+   if not stable(tt,s):
+    m['reason']=f'Probe rejected: stability limit (HW {tt.get("error_pct",0):.2f}% / reject {tt.get("reject_pct",0):.2f}%)'
+   elif tt_vr_hot:m['reason']=f'Probe rejected: VRM exceeded target band ({tt.get("vr_temp",0):.1f}°C)'
+   elif tt_asic_hot:m['reason']=f'Probe rejected: ASIC exceeded target band ({tt.get("temp",0):.1f}°C)'
+   elif not efficient and not target_improved:m['reason']='Probe rejected: no target-balance or J/TH improvement'
+   else:m['reason']='Probe rejected — restored prior stable point'
   else:m['reason']='Holding stable operating point'
   await asyncio.sleep(s['settle_seconds'])
 
