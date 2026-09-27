@@ -4,7 +4,7 @@ name: Bitaxe Optimizer
 tagline: Optimize Bitaxe miners for temperature, fan speed, stability, and efficiency
 icon: https://raw.githubusercontent.com/rhenry86/bitaxe-optimizer/main/rhenry86-bitaxe-optimizer/icon.svg
 category: bitcoin
-version: "2.4.1"
+version: "2.4.2"
 port: 8080
 description: Automatically tunes Bitaxe/AxeOS miners while balancing ASIC temperature and fan-speed targets, VRM thermals, stability limits, and measured J/TH efficiency.
 developer: rhenry86
@@ -14,7 +14,7 @@ submission: https://github.com/rhenry86/bitaxe-optimizer
 repo: https://github.com/rhenry86/bitaxe-optimizer
 support: https://github.com/rhenry86/bitaxe-optimizer/issues
 gallery: []
-releaseNotes: Hotfix: individual ASIC telemetry parsing is now fully defensive and cannot interrupt normal miner polling. Unsupported AxeOS per-chip telemetry shapes simply disable ASIC-balance monitoring while all normal miner telemetry and optimization continue.
+releaseNotes: Emergency rollback to the known-working v2.3.1 runtime. Removes the new individual-ASIC parsing/monitoring code while retaining probe-fault protection and automatic AxeOS restart recovery.
 dependencies: []
 path: ""
 defaultUsername: ""
