@@ -137,7 +137,9 @@ async def auto_fan(m,on=True): await patch(m['host'],{'autofanspeed':1 if on els
 # AxeOS realtime logs are streamed at ws://<miner>/api/ws.
 ASIC_WATCH_THRESHOLD=0.70
 ASIC_WATCH_SAMPLES=3
-ASIC_WATCH_RECOVERY_HOLD=120
+ASIC_WATCH_RECOVERY_HOLD=300
+OCTAXE_RECOVERY_FREQUENCY=600
+OCTAXE_RECOVERY_VOLTAGE=1150
 
 def _host_only(host):
  h=host.strip().replace('http://','').replace('https://','')
@@ -231,9 +233,21 @@ async def chip_watchdog(mid):
 
     if fault:
      i,h,peer_avg,ratio=fault
-     wd.update({'status':'Restarting','fault_chip':i+1,'fault_rate':h,'peer_average':peer_avg,'fault_ratio_pct':ratio*100,'fault_time':time.time()})
+     # Remember the operating point that produced the chip fault so efficiency
+     # search cannot immediately walk back into it after recovery.
+     tf=m.get('telemetry') or {}
+     bad_f=tf.get('frequency');bad_v=tf.get('voltage')
+     pf=m.setdefault('probe_fault',{})
+     if bad_v is not None and bad_v < OCTAXE_RECOVERY_VOLTAGE:
+      pf['unsafe_below_v']=bad_v
+      pf['safe_min_v']=min(m['settings']['max_voltage'],bad_v+float(m['settings'].get('probe_fault_guard_mv',15)))
+     if bad_f is not None and bad_f < OCTAXE_RECOVERY_FREQUENCY:
+      pf['unsafe_below_f']=bad_f
+      pf['safe_min_f']=min(m['settings']['max_frequency'],bad_f+float(m['settings'].get('probe_fault_guard_mhz',12.5)))
+     wd.update({'status':'Restarting','fault_chip':i+1,'fault_rate':h,'peer_average':peer_avg,'fault_ratio_pct':ratio*100,
+                'fault_time':time.time(),'unsafe_frequency':bad_f,'unsafe_voltage':bad_v,'recovery_pending':True})
      m['effsearch']={};m['efficiency_lock']=False
-     m['reason']=f'ASIC #{i+1} fault — {h:.1f} GH/s vs {peer_avg:.1f} peer avg ({ratio*100:.0f}%); restarting AxeOS'
+     m['reason']=f'ASIC #{i+1} fault — {h:.1f} GH/s vs {peer_avg:.1f} peer avg ({ratio*100:.0f}%); restarting AxeOS for stock recovery'
      async with httpx.AsyncClient(timeout=10) as c:
       r=await c.post(base(m['host'])+'/api/system/restart');r.raise_for_status()
      wd['hold_until']=time.time()+ASIC_WATCH_RECOVERY_HOLD
@@ -262,7 +276,21 @@ async def poll(mid):
  while mid in miners:
   m=miners[mid]
   try:
-   t=norm(await getj(m['host'],'/api/system/info'),m);m['telemetry']=t;m['online']=True;record_optimizer_snapshot(m)
+   t=norm(await getj(m['host'],'/api/system/info'),m);m['telemetry']=t;m['online']=True
+   wd=m.get('chip_watchdog') or {}
+   if wd.get('recovery_pending'):
+    # AxeOS is reachable again after the watchdog restart. Force the confirmed
+    # NerdOCTAXE stock point before optimizer/search logic is allowed to continue.
+    try:
+     await patch(m['host'],{'overclockEnabled':1,'frequency':OCTAXE_RECOVERY_FREQUENCY,'coreVoltage':OCTAXE_RECOVERY_VOLTAGE})
+     m['stability_trim']=0.0;m['effsearch']={};m['efficiency_lock']=False
+     wd['recovery_pending']=False;wd['stock_recovery_applied']=time.time()
+     wd['hold_until']=time.time()+ASIC_WATCH_RECOVERY_HOLD
+     m['reason']=f'OctAxe recovered at stock {OCTAXE_RECOVERY_FREQUENCY} MHz / {OCTAXE_RECOVERY_VOLTAGE} mV — 5 minute stabilization hold'
+    except Exception:
+     # Leave recovery_pending set so the next normal poll retries safely.
+     pass
+   record_optimizer_snapshot(m)
    c=con();c.execute('INSERT INTO samples(miner_id,ts,payload) VALUES(?,?,?)',(mid,time.time(),json.dumps(t)));c.commit();c.close()
   except Exception:m['online']=False
   await asyncio.sleep(5)
@@ -271,6 +299,11 @@ async def optimize(mid):
  while mid in miners:
   s=m['settings'];t=m.get('telemetry',{})
   if not m.get('online') or not t:m['reason']='Waiting for telemetry';await asyncio.sleep(5);continue
+  wd=m.get('chip_watchdog') or {}
+  if wd.get('recovery_pending') or time.time()<wd.get('hold_until',0):
+   if not wd.get('recovery_pending'):
+    m['reason']=f'OctAxe stock recovery hold — {OCTAXE_RECOVERY_FREQUENCY} MHz / {OCTAXE_RECOVERY_VOLTAGE} mV'
+   await asyncio.sleep(5);continue
   x=fv_to_op(t.get('frequency'),t.get('voltage'),s);asic_hot,vr_hot,fan_high,cool_asic,cool_vr,fan_low=demands(t,s)
   if hard_hot(t,s):
    await set_op(m,0);await auto_fan(m,True);m['mode']='autofan';m['recovery_since']=None;m['reason']='Hard thermal limit — minimum F/V + AxeOS Auto Fan';await asyncio.sleep(s['settle_seconds']);continue
