@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-import asyncio,json,os,sqlite3,time,ipaddress,socket
+import asyncio,json,os,sqlite3,time,ipaddress,socket,re,base64,hashlib,struct,secrets
 from pathlib import Path
 from fastapi import FastAPI,HTTPException
 from fastapi.responses import FileResponse
@@ -11,7 +11,7 @@ from collections import deque
 from fastapi.responses import StreamingResponse
 
 DATA=Path(os.getenv('DATA_DIR','/data')); DATA.mkdir(parents=True,exist_ok=True)
-DB=DATA/'optimizer.db'; app=FastAPI(title='Bitaxe Optimizer'); miners={}; tasks={}
+DB=DATA/'optimizer.db'; app=FastAPI(title='Bitaxe Optimizer'); miners={}; tasks={}; watchdog_tasks={}
 DEFAULT={
  'asic_temp_target':55.0,'vr_temp_target':65.0,'fan_target':65.0,'vr_cooling':'shared',
  'min_frequency':400.0,'max_frequency':600.0,'min_voltage':1000.0,'max_voltage':1150.0,
@@ -131,6 +131,133 @@ async def set_op(m,x):
  f,v=op_to_fv(x,m['settings']);trim=m.get('stability_trim',0)
  return await set_fv(m,f,v+trim)
 async def auto_fan(m,on=True): await patch(m['host'],{'autofanspeed':1 if on else 0})
+
+# OctAxe individual-chip watchdog.
+# Deliberately isolated from /api/system/info polling and optimizer logic.
+# AxeOS realtime logs are streamed at ws://<miner>/api/ws.
+ASIC_WATCH_THRESHOLD=0.70
+ASIC_WATCH_SAMPLES=3
+ASIC_WATCH_RECOVERY_HOLD=120
+
+def _host_only(host):
+ h=host.strip().replace('http://','').replace('https://','')
+ return h.split('/')[0].split(':')[0]
+
+async def _ws_send_pong(writer,payload=b''):
+ # WebSocket client frames must be masked.
+ mask=secrets.token_bytes(4)
+ n=len(payload)
+ head=bytes([0x8A])
+ if n<126: head+=bytes([0x80|n])
+ elif n<65536: head+=bytes([0x80|126])+struct.pack('!H',n)
+ else: head+=bytes([0x80|127])+struct.pack('!Q',n)
+ masked=bytes(b ^ mask[i%4] for i,b in enumerate(payload))
+ writer.write(head+mask+masked);await writer.drain()
+
+async def _ws_read_frame(reader,writer):
+ h=await reader.readexactly(2);opcode=h[0]&0x0f;masked=bool(h[1]&0x80);n=h[1]&0x7f
+ if n==126:n=struct.unpack('!H',await reader.readexactly(2))[0]
+ elif n==127:n=struct.unpack('!Q',await reader.readexactly(8))[0]
+ mask=await reader.readexactly(4) if masked else None
+ payload=await reader.readexactly(n) if n else b''
+ if mask:payload=bytes(b ^ mask[i%4] for i,b in enumerate(payload))
+ if opcode==9:
+  await _ws_send_pong(writer,payload);return None
+ if opcode==8:raise ConnectionError('WebSocket closed')
+ if opcode in (1,2,0):return payload
+ return None
+
+async def _open_log_ws(host):
+ ip=_host_only(host)
+ reader,writer=await asyncio.wait_for(asyncio.open_connection(ip,80),timeout=6)
+ key=base64.b64encode(secrets.token_bytes(16)).decode()
+ request=(f'GET /api/ws HTTP/1.1\r\nHost: {ip}\r\nOrigin: http://{ip}\r\n'
+          f'Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n'
+          'Sec-WebSocket-Version: 13\r\n\r\n')
+ writer.write(request.encode());await writer.drain()
+ status=(await asyncio.wait_for(reader.readline(),timeout=6)).decode(errors='ignore')
+ headers={}
+ while True:
+  line=await asyncio.wait_for(reader.readline(),timeout=6)
+  if line in (b'\r\n',b'\n',b''):break
+  text=line.decode(errors='ignore').strip()
+  if ':' in text:
+   k,v=text.split(':',1);headers[k.lower().strip()]=v.strip()
+ if '101' not in status:
+  writer.close();await writer.wait_closed();raise ConnectionError(f'WebSocket handshake failed: {status.strip()}')
+ expected=base64.b64encode(hashlib.sha1((key+'258EAFA5-E914-47DA-95CA-C5AB0DC85B11').encode()).digest()).decode()
+ if headers.get('sec-websocket-accept')!=expected:
+  writer.close();await writer.wait_closed();raise ConnectionError('WebSocket accept mismatch')
+ return reader,writer
+
+def _chip_rates_from_log(text):
+ # Example:
+ # hashrate_monitor: chip hashrates: 1075.46GH/s / ... / 1081.47GH/s  (total: ...)
+ if 'hashrate_monitor:' not in text or 'chip hashrates:' not in text:return None
+ tail=text.split('chip hashrates:',1)[1].split('(total:',1)[0]
+ vals=[float(x) for x in re.findall(r'([0-9]+(?:\.[0-9]+)?)\s*GH/s',tail)]
+ return vals if len(vals)==8 else None
+
+async def chip_watchdog(mid):
+ bad=[0]*8
+ while mid in miners:
+  m=miners[mid];writer=None
+  try:
+   reader,writer=await _open_log_ws(m['host'])
+   m['chip_watchdog']={'connected':True,'threshold_pct':70,'required_samples':3,'rates':[],'status':'Monitoring'}
+   while mid in miners:
+    payload=await asyncio.wait_for(_ws_read_frame(reader,writer),timeout=90)
+    if payload is None:continue
+    text=payload.decode(errors='ignore')
+    rates=_chip_rates_from_log(text)
+    if rates is None:continue
+
+    wd=m.setdefault('chip_watchdog',{})
+    wd.update({'connected':True,'threshold_pct':70,'required_samples':3,'rates':rates,'last_update':time.time()})
+
+    # Suppress fault decisions during a post-restart stabilization hold.
+    if time.time()<wd.get('hold_until',0):
+     bad=[0]*8;wd['status']='Post-restart stabilization hold';continue
+
+    fault=None
+    for i,h in enumerate(rates):
+     peers=rates[:i]+rates[i+1:]
+     peer_avg=sum(peers)/len(peers)
+     ratio=h/peer_avg if peer_avg>0 else 1.0
+     if ratio<ASIC_WATCH_THRESHOLD:bad[i]+=1
+     else:bad[i]=0
+     if bad[i]>=ASIC_WATCH_SAMPLES:
+      fault=(i,h,peer_avg,ratio);break
+
+    if fault:
+     i,h,peer_avg,ratio=fault
+     wd.update({'status':'Restarting','fault_chip':i+1,'fault_rate':h,'peer_average':peer_avg,'fault_ratio_pct':ratio*100,'fault_time':time.time()})
+     m['effsearch']={};m['efficiency_lock']=False
+     m['reason']=f'ASIC #{i+1} fault — {h:.1f} GH/s vs {peer_avg:.1f} peer avg ({ratio*100:.0f}%); restarting AxeOS'
+     async with httpx.AsyncClient(timeout=10) as c:
+      r=await c.post(base(m['host'])+'/api/system/restart');r.raise_for_status()
+     wd['hold_until']=time.time()+ASIC_WATCH_RECOVERY_HOLD
+     bad=[0]*8
+     # Restart will normally close this socket; reconnect cleanly either way.
+     try:writer.close();await writer.wait_closed()
+     except Exception:pass
+     await asyncio.sleep(15)
+     break
+  except asyncio.CancelledError:
+   if writer:
+    try:writer.close();await writer.wait_closed()
+    except Exception:pass
+   raise
+  except Exception as e:
+   wd=m.setdefault('chip_watchdog',{})
+   wd.update({'connected':False,'status':'Reconnecting','last_error':str(e)})
+   # Crucially: watchdog failure never changes miner online state or normal telemetry.
+   await asyncio.sleep(5)
+  finally:
+   if writer:
+    try:writer.close();await writer.wait_closed()
+    except Exception:pass
+
 async def poll(mid):
  while mid in miners:
   m=miners[mid]
@@ -400,7 +527,8 @@ async def probe_ip(ip,sem):
 @app.on_event('startup')
 async def startup():
  init()
- for mid in list(miners):asyncio.create_task(poll(mid))
+ for mid in list(miners):
+  asyncio.create_task(poll(mid));watchdog_tasks[mid]=asyncio.create_task(chip_watchdog(mid))
 @app.get('/')
 async def index():return FileResponse(Path(__file__).parent/'static/index.html')
 
@@ -479,12 +607,14 @@ async def ls():return list(miners.values())
 @app.post('/api/miners')
 async def add(x:MinerIn):
  c=con();q=c.execute('INSERT INTO miners(name,host,settings) VALUES(?,?,?)',(x.name,x.host,json.dumps(DEFAULT)));mid=q.lastrowid;c.commit();c.close()
- miners[mid]={'id':mid,'name':x.name,'host':x.host,'settings':dict(DEFAULT),'online':False,'telemetry':{},'reason':'Starting telemetry','mode':'paused','recovery_since':None,'last_shares':None,'stability_trim':0.0,'effsearch':{},'stable_since':None};asyncio.create_task(poll(mid));return miners[mid]
+ miners[mid]={'id':mid,'name':x.name,'host':x.host,'settings':dict(DEFAULT),'online':False,'telemetry':{},'reason':'Starting telemetry','mode':'paused','recovery_since':None,'last_shares':None,'stability_trim':0.0,'effsearch':{},'stable_since':None};asyncio.create_task(poll(mid));watchdog_tasks[mid]=asyncio.create_task(chip_watchdog(mid));return miners[mid]
 @app.delete('/api/miners/{mid}')
 async def rem(mid:int):
  if mid not in miners:raise HTTPException(404)
  q=tasks.pop(mid,None)
  if q:q.cancel()
+ w=watchdog_tasks.pop(mid,None)
+ if w:w.cancel()
  c=con();c.execute('DELETE FROM samples WHERE miner_id=?',(mid,));c.execute('DELETE FROM miners WHERE id=?',(mid,));c.commit();c.close();miners.pop(mid);return {'ok':True}
 @app.get('/api/miners/{mid}/settings')
 async def gs(mid:int):
