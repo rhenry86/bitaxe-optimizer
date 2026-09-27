@@ -62,13 +62,22 @@ def norm(d,m=None):
   if prev:
    da=max(0,a-prev[0]); dr=max(0,r-prev[1]); reject=100*dr/(da+dr) if da+dr>0 else 0.0
  elif a is not None and r is not None and a+r>0: reject=100*r/(a+r)
- # Individual ASIC hashrates from AxeOS hashrateMonitor.asics.
- hm=j.get('hashrateMonitor') or {};raw_asics=hm.get('asics') or [];vals=[]
- for a in raw_asics:
-  try:
-   val=a.get('hashrate') if isinstance(a,dict) else a
+ # Optional per-ASIC telemetry. Never allow chip parsing to break normal miner telemetry.
+ vals=[]
+ try:
+  hm=j.get('hashrateMonitor') or {}
+  raw=hm.get('asics') if isinstance(hm,dict) else None
+  items=list(raw.values()) if isinstance(raw,dict) else (raw if isinstance(raw,list) else [])
+  for a in items:
+   val=None
+   if isinstance(a,(int,float)): val=a
+   elif isinstance(a,dict):
+    for key in ('hashrate','hashRate','hash_rate','rate'):
+     if a.get(key) is not None:
+      val=a.get(key);break
    if val is not None: vals.append(float(val))
-  except Exception: pass
+ except Exception:
+  vals=[]
  t['asic_hashrates']=vals
  return {'temp':num(d,'temp'),'fan':num(d,'fanspeed'),'fan_rpm':num(d,'fanrpm'),'fan2_rpm':num(d,'fan2rpm'),
  'hashrate':h,'power':p,'jth':p/h if p and h and h>0 else None,'vr_temp':num(d,'vrTemp'),
