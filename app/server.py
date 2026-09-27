@@ -62,6 +62,14 @@ def norm(d,m=None):
   if prev:
    da=max(0,a-prev[0]); dr=max(0,r-prev[1]); reject=100*dr/(da+dr) if da+dr>0 else 0.0
  elif a is not None and r is not None and a+r>0: reject=100*r/(a+r)
+ # Individual ASIC hashrates from AxeOS hashrateMonitor.asics.
+ hm=j.get('hashrateMonitor') or {};raw_asics=hm.get('asics') or [];vals=[]
+ for a in raw_asics:
+  try:
+   val=a.get('hashrate') if isinstance(a,dict) else a
+   if val is not None: vals.append(float(val))
+  except Exception: pass
+ t['asic_hashrates']=vals
  return {'temp':num(d,'temp'),'fan':num(d,'fanspeed'),'fan_rpm':num(d,'fanrpm'),'fan2_rpm':num(d,'fan2rpm'),
  'hashrate':h,'power':p,'jth':p/h if p and h and h>0 else None,'vr_temp':num(d,'vrTemp'),
  'error_pct':num(d,'errorPercentage') or 0.0,'accepted':a,'rejected':r,'reject_pct':reject,
@@ -157,6 +165,45 @@ async def optimize(mid):
     nv=min(s['max_voltage'],v+step);m['stability_trim']=nv-op_to_fv(x,s)[1]
     await set_fv(m,f,nv);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
    nx=max(0,x-s['op_step']);nf,bv=op_to_fv(nx,s);m['stability_trim']=s['max_voltage']-bv;await set_fv(m,nf,s['max_voltage']);m['effsearch']={};m['reason']=f'Max voltage still unstable — frequency ↓ to {nf:.0f} MHz, holding {s["max_voltage"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+  # Always-on individual ASIC balance monitor.
+  ah=t.get('asic_hashrates') or []
+  ab=m.setdefault('asic_balance',{'bad_counts':{}})
+  threshold=float(s.get('asic_balance_threshold',70))/100.0
+  required=max(1,int(s.get('asic_balance_samples',3)))
+  if len(ah)>=2:
+   bad_counts=ab.setdefault('bad_counts',{});fault=None
+   for i,h in enumerate(ah):
+    peers=[x for n,x in enumerate(ah) if n!=i and x is not None and x>=0]
+    peer_avg=(sum(peers)/len(peers)) if peers else 0
+    ratio=(h/peer_avg) if peer_avg>0 else 1
+    bad_counts[str(i)]=bad_counts.get(str(i),0)+1 if peer_avg>0 and ratio<threshold else 0
+    if bad_counts[str(i)]>=required:
+     fault=(i,h,peer_avg,ratio);break
+   if fault and not ab.get('restart_pending'):
+    i,h,peer_avg,ratio=fault;ab['restart_pending']=True;m['effsearch']={};m['efficiency_lock']=False
+    try:
+     async with httpx.AsyncClient(timeout=10) as c:
+      r=await c.post(f'http://{m["host"]}/api/system/restart');r.raise_for_status()
+     ab['recover_until']=time.time()+s.get('probe_restart_timeout',180)
+     m['reason']=f'ASIC #{i+1} fault — {h:.3f} vs {peer_avg:.3f} peer avg ({ratio*100:.0f}%); AxeOS restart sent'
+     await asyncio.sleep(10);continue
+    except Exception as e:
+     ab['restart_pending']=False;m['reason']=f'ASIC #{i+1} fault detected but restart failed: {e}'
+     await asyncio.sleep(5);continue
+   if ab.get('restart_pending'):
+    all_good=True
+    for i,h in enumerate(ah):
+     peers=[x for n,x in enumerate(ah) if n!=i and x is not None and x>=0]
+     pa=(sum(peers)/len(peers)) if peers else 0
+     if pa>0 and h/pa<threshold: all_good=False;break
+    if all_good:
+     ab['restart_pending']=False;ab['bad_counts']={};ab['recover_until']=time.time()+s.get('probe_recovery_seconds',120)
+     m['reason']='All ASICs balanced after restart — stabilization hold active'
+    elif time.time()<ab.get('recover_until',0):
+     m['reason']='Waiting for individual ASIC recovery after AxeOS restart';await asyncio.sleep(10);continue
+  if time.time()<ab.get('recover_until',0):
+   m['reason']='ASIC recovery stabilization hold';await asyncio.sleep(min(10,max(1,ab['recover_until']-time.time())));continue
+
   # Probe-fault protection for multi-ASIC miners.
   # If a search probe causes >5% hashrate loss, restore last known-good F/V,
   # remember that unsafe boundary, and pause further probing.
