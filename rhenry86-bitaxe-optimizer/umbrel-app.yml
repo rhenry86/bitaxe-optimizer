@@ -4,7 +4,7 @@ name: Bitaxe Optimizer
 tagline: Optimize Bitaxe miners for temperature, fan speed, stability, and efficiency
 icon: https://raw.githubusercontent.com/rhenry86/bitaxe-optimizer/main/rhenry86-bitaxe-optimizer/icon.svg
 category: bitcoin
-version: "2.5.2"
+version: "2.6.0"
 port: 8080
 description: Automatically tunes Bitaxe/AxeOS miners while balancing ASIC temperature and fan-speed targets, VRM thermals, stability limits, and measured J/TH efficiency.
 developer: rhenry86
@@ -14,7 +14,7 @@ submission: https://github.com/rhenry86/bitaxe-optimizer
 repo: https://github.com/rhenry86/bitaxe-optimizer
 support: https://github.com/rhenry86/bitaxe-optimizer/issues
 gallery: []
-releaseNotes: OctAxe chip-fault recovery now restarts AxeOS, forces the confirmed stock 600 MHz / 1150 mV point as soon as telemetry returns, blocks optimizer changes for 5 minutes, and remembers the failed F/V boundary to avoid immediately repeating the unstable undervolt.
+releaseNotes: Adds a per-miner Lock F/V mode. When enabled, the miner is fixed at its configured maximum frequency and voltage, AxeOS Auto Fan is forced ON, efficiency/stability F/V probing is disabled, and the individual-chip watchdog remains active.
 dependencies: []
 path: ""
 defaultUsername: ""
