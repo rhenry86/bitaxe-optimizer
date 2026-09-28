@@ -17,7 +17,7 @@ DEFAULT={
  'min_frequency':400.0,'max_frequency':600.0,'min_voltage':1000.0,'max_voltage':1150.0,
  'op_step':0.05,'max_asic_temp':65.0,'max_vr_temp':75.0,'max_error_pct':3.0,'max_reject_pct':1.0,
  'settle_seconds':30,'temp_deadband':0.5,'vr_temp_deadband':1.0,'fan_deadband':2.0,'recovery_seconds':90,
- 'stability_voltage_step':15.0,'stability_probe_seconds':60,'stability_trim_decay':5.0,'lock_fv':False
+ 'stability_voltage_step':15.0,'stability_probe_seconds':60,'stability_trim_decay':5.0,'lock_fv':False,'reject_min_shares':10,'trim_decay_error_fraction':0.5,'max_positive_trim':60.0
 }
 class MinerIn(BaseModel): name:str; host:str
 class Settings(BaseModel):
@@ -29,6 +29,7 @@ class Settings(BaseModel):
  settle_seconds:int=Field(30,ge=10,le=600); recovery_seconds:int=Field(90,ge=15,le=1800)
  temp_deadband:float=Field(.5,ge=0,le=10); vr_temp_deadband:float=Field(1,ge=0,le=15); fan_deadband:float=Field(2,ge=0,le=30)
  stability_voltage_step:float=Field(15,ge=1,le=100); stability_probe_seconds:int=Field(60,ge=15,le=900); stability_trim_decay:float=Field(5,ge=1,le=50); lock_fv:bool=False
+ reject_min_shares:int=Field(10,ge=1,le=1000); trim_decay_error_fraction:float=Field(.5,ge=0,le=1); max_positive_trim:float=Field(60,ge=0,le=250)
 
 def merged_settings(raw):
  d=dict(DEFAULT); d.update(raw or {}); return d
@@ -61,10 +62,14 @@ def norm(d,m=None):
   prev=m.get('last_shares'); m['last_shares']=(a,r)
   if prev:
    da=max(0,a-prev[0]); dr=max(0,r-prev[1]); reject=100*dr/(da+dr) if da+dr>0 else 0.0
- elif a is not None and r is not None and a+r>0: reject=100*r/(a+r)
+   reject_samples=da+dr
+  else: reject_samples=0
+ elif a is not None and r is not None and a+r>0:
+  reject=100*r/(a+r); reject_samples=a+r
+ else: reject_samples=0
  return {'temp':num(d,'temp'),'fan':num(d,'fanspeed'),'fan_rpm':num(d,'fanrpm'),'fan2_rpm':num(d,'fan2rpm'),
  'hashrate':h,'power':p,'jth':p/h if p and h and h>0 else None,'vr_temp':num(d,'vrTemp'),
- 'error_pct':num(d,'errorPercentage') or 0.0,'accepted':a,'rejected':r,'reject_pct':reject,
+ 'error_pct':num(d,'errorPercentage') or 0.0,'accepted':a,'rejected':r,'reject_pct':reject,'reject_samples':reject_samples,
  'frequency':num(d,'frequency'),'voltage':num(d,'coreVoltage'),'autofan':num(d,'autofanspeed')}
 def op_to_fv(x,s):
  x=max(0,min(1,x)); return round(s['min_frequency']+x*(s['max_frequency']-s['min_frequency'])),round(s['min_voltage']+x*(s['max_voltage']-s['min_voltage']))
@@ -74,7 +79,9 @@ def fv_to_op(f,v,s):
  if f is not None and s['max_frequency']>s['min_frequency']:
   return max(0,min(1,(f-s['min_frequency'])/(s['max_frequency']-s['min_frequency'])))
  return 0
-def stable(t,s): return t.get('error_pct',0)<=s['max_error_pct'] and t.get('reject_pct',0)<=s['max_reject_pct']
+def stable(t,s):
+ reject_ok=t.get('reject_samples',0)<s.get('reject_min_shares',10) or t.get('reject_pct',0)<=s['max_reject_pct']
+ return t.get('error_pct',0)<=s['max_error_pct'] and reject_ok
 def hard_hot(t,s): return (t.get('temp') is not None and t['temp']>=s['max_asic_temp']) or (t.get('vr_temp') is not None and t['vr_temp']>=s['max_vr_temp'])
 def demands(t,s):
  asic=t.get('temp') is not None and t['temp']>s['asic_temp_target']+s['temp_deadband']
@@ -282,7 +289,10 @@ async def poll(mid):
     # AxeOS is reachable again after the watchdog restart. Force the confirmed
     # NerdOCTAXE stock point before optimizer/search logic is allowed to continue.
     try:
-     await patch(m['host'],{'overclockEnabled':1,'frequency':OCTAXE_RECOVERY_FREQUENCY,'coreVoltage':OCTAXE_RECOVERY_VOLTAGE})
+     rs=m['settings']
+     rf=round(rs['max_frequency']) if rs.get('lock_fv') else OCTAXE_RECOVERY_FREQUENCY
+     rv=round(rs['max_voltage']) if rs.get('lock_fv') else OCTAXE_RECOVERY_VOLTAGE
+     await patch(m['host'],{'overclockEnabled':1,'frequency':rf,'coreVoltage':rv})
      m['stability_trim']=0.0;m['effsearch']={};m['efficiency_lock']=False
      wd['recovery_pending']=False;wd['stock_recovery_applied']=time.time()
      wd['hold_until']=time.time()+ASIC_WATCH_RECOVERY_HOLD
@@ -302,12 +312,12 @@ async def optimize(mid):
   s=m['settings']
   if s.get('lock_fv'):
    lf=round(s['max_frequency']);lv=round(s['max_voltage'])
-   # Enforce the fixed point if AxeOS rebooted or anything changed it.
-   if t.get('frequency') is None or t.get('voltage') is None or abs(t.get('frequency')-lf)>0.5 or abs(t.get('voltage')-lv)>0.5 or t.get('autofan')!=1:
-    try: await patch(m['host'],{'overclockEnabled':1,'frequency':lf,'coreVoltage':lv,'autofanspeed':1})
+   # Enforce frequency/voltage only. Lock mode never writes fan settings.
+   if t.get('frequency') is None or t.get('voltage') is None or abs(t.get('frequency')-lf)>0.5 or abs(t.get('voltage')-lv)>0.5:
+    try: await patch(m['host'],{'overclockEnabled':1,'frequency':lf,'coreVoltage':lv})
     except Exception: pass
    m['effsearch']={};m['efficiency_lock']=False;m['stability_trim']=0.0
-   m['reason']=f'F/V locked at {lf} MHz / {lv} mV — AxeOS Auto Fan ON'
+   m['reason']=f'F/V locked at {lf} MHz / {lv} mV — fan control unchanged'
    await asyncio.sleep(5);continue
   wd=m.get('chip_watchdog') or {}
   if wd.get('recovery_pending') or time.time()<wd.get('hold_until',0):
@@ -323,10 +333,28 @@ async def optimize(mid):
    f=t.get('frequency') if t.get('frequency') is not None else op_to_fv(x,s)[0]
    v=t.get('voltage') if t.get('voltage') is not None else op_to_fv(x,s)[1]
    step=s['stability_voltage_step'];m['stable_since']=None;m['recovery_since']=None
-   if v < s['max_voltage']-0.5:
-    nv=min(s['max_voltage'],v+step);m['stability_trim']=nv-op_to_fv(x,s)[1]
+   base_v=op_to_fv(x,s)[1];trim_cap=max(0,float(s.get('max_positive_trim',60)))
+   allowed_v=min(s['max_voltage'],base_v+trim_cap)
+   if v < allowed_v-0.5:
+    nv=min(allowed_v,v+step);m['stability_trim']=nv-base_v
     await set_fv(m,f,nv);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
-   nx=max(0,x-s['op_step']);nf,bv=op_to_fv(nx,s);m['stability_trim']=s['max_voltage']-bv;await set_fv(m,nf,s['max_voltage']);m['effsearch']={};m['reason']=f'Max voltage still unstable — frequency ↓ to {nf:.0f} MHz, holding {s["max_voltage"]:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+   nx=max(0,x-s['op_step']);nf,bv=op_to_fv(nx,s);nv=min(s['max_voltage'],bv+trim_cap);m['stability_trim']=nv-bv;await set_fv(m,nf,nv);m['effsearch']={};m['reason']=f'Voltage-trim cap reached and still unstable — frequency ↓ to {nf:.0f} MHz, voltage {nv:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+  # Use the configured HW-error budget instead of chasing 0% errors.
+  trim=m.get('stability_trim',0.0)
+  if trim>0 and t.get('error_pct',0) <= s['max_error_pct']*float(s.get('trim_decay_error_fraction',0.5)):
+   if m.get('stable_since') is None:m['stable_since']=time.time()
+   if time.time()-m['stable_since'] >= s['stability_probe_seconds']:
+    f=t.get('frequency') if t.get('frequency') is not None else op_to_fv(x,s)[0]
+    base_v=op_to_fv(x,s)[1]
+    new_trim=max(0.0,trim-max(float(s.get('stability_trim_decay',5)),float(s.get('stability_voltage_step',15))))
+    nv=min(s['max_voltage'],base_v+new_trim)
+    m['stability_trim']=new_trim;m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time()
+    await set_fv(m,f,nv)
+    m['reason']=f'Error budget available — voltage trim ↓ {trim:.0f}→{new_trim:.0f} mV (HW {t.get("error_pct",0):.2f}% / {s["max_error_pct"]:.2f}% limit)'
+    await asyncio.sleep(s['settle_seconds']);continue
+  elif t.get('error_pct',0) > s['max_error_pct']*float(s.get('trim_decay_error_fraction',0.5)):
+   m['stable_since']=None
+
   # Probe-fault protection for multi-ASIC miners.
   # If a search probe causes >5% hashrate loss, restore last known-good F/V,
   # remember that unsafe boundary, and pause further probing.
@@ -670,11 +698,15 @@ async def ss(mid:int,x:Settings):
  if d['vr_cooling'] not in ('shared','separate','passive'):raise HTTPException(400,'Invalid VRM cooling mode')
  if d['max_frequency']<=d['min_frequency'] or d['max_voltage']<=d['min_voltage']:raise HTTPException(400,'Maximums must exceed minimums')
  if d['max_asic_temp']<=d['asic_temp_target'] or d['max_vr_temp']<=d['vr_temp_target']:raise HTTPException(400,'Hard thermal maximums must exceed targets')
+ was_locked=bool(miners[mid]['settings'].get('lock_fv'))
  miners[mid]['settings']=d
  if d.get('lock_fv'):
   miners[mid]['effsearch']={};miners[mid]['efficiency_lock']=False;miners[mid]['stability_trim']=0.0
-  await patch(miners[mid]['host'],{'overclockEnabled':1,'frequency':round(d['max_frequency']),'coreVoltage':round(d['max_voltage']),'autofanspeed':1})
-  miners[mid]['reason']=f'F/V locked at {d["max_frequency"]:.0f} MHz / {d["max_voltage"]:.0f} mV — AxeOS Auto Fan ON'
+  await patch(miners[mid]['host'],{'overclockEnabled':1,'frequency':round(d['max_frequency']),'coreVoltage':round(d['max_voltage'])})
+  miners[mid]['reason']=f'F/V locked at {d["max_frequency"]:.0f} MHz / {d["max_voltage"]:.0f} mV — fan control unchanged'
+ elif was_locked:
+  miners[mid]['effsearch']={};miners[mid]['efficiency_lock']=False;miners[mid]['stable_since']=time.time()
+  miners[mid]['reason']='F/V lock released — optimizer control restored; fan control unchanged'
  c=con();c.execute('UPDATE miners SET settings=? WHERE id=?',(json.dumps(d),mid));c.commit();c.close();return d
 @app.post('/api/miners/{mid}/optimize')
 async def go(mid:int):
