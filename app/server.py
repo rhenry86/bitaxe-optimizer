@@ -57,19 +57,23 @@ def norm(d,m=None):
  h_ghs=num(d,'hashRate_1m','hashRate')
  h=(h_ghs/1000.0) if h_ghs is not None else None
  a=num(d,'sharesAccepted');r=num(d,'sharesRejected')
- reject=0.0
+ reject=0.0; reject_delta=0; accepted_delta=0; share_counter_reset=False
  if m is not None and a is not None and r is not None:
   prev=m.get('last_shares'); m['last_shares']=(a,r)
   if prev:
-   da=max(0,a-prev[0]); dr=max(0,r-prev[1]); reject=100*dr/(da+dr) if da+dr>0 else 0.0
-   reject_samples=da+dr
+   if a < prev[0] or r < prev[1]:
+    share_counter_reset=True; reject_samples=0
+   else:
+    accepted_delta=int(a-prev[0]); reject_delta=int(r-prev[1])
+    reject_samples=accepted_delta+reject_delta
+    reject=100*reject_delta/reject_samples if reject_samples>0 else 0.0
   else: reject_samples=0
  elif a is not None and r is not None and a+r>0:
-  reject=100*r/(a+r); reject_samples=a+r
+  reject_samples=a+r
  else: reject_samples=0
  return {'temp':num(d,'temp'),'fan':num(d,'fanspeed'),'fan_rpm':num(d,'fanrpm'),'fan2_rpm':num(d,'fan2rpm'),
  'hashrate':h,'power':p,'jth':p/h if p and h and h>0 else None,'vr_temp':num(d,'vrTemp'),
- 'error_pct':num(d,'errorPercentage') or 0.0,'accepted':a,'rejected':r,'reject_pct':reject,'reject_samples':reject_samples,
+ 'error_pct':num(d,'errorPercentage') or 0.0,'accepted':a,'rejected':r,'accepted_delta':accepted_delta,'reject_delta':reject_delta,'reject_pct':reject,'reject_samples':reject_samples,'share_counter_reset':share_counter_reset,'asic_count':int(num(d,'asicCount') or 1),
  'frequency':num(d,'frequency'),'voltage':num(d,'coreVoltage'),'autofan':num(d,'autofanspeed')}
 def op_to_fv(x,s):
  x=max(0,min(1,x)); return round(s['min_frequency']+x*(s['max_frequency']-s['min_frequency'])),round(s['min_voltage']+x*(s['max_voltage']-s['min_voltage']))
@@ -79,7 +83,11 @@ def fv_to_op(f,v,s):
  if f is not None and s['max_frequency']>s['min_frequency']:
   return max(0,min(1,(f-s['min_frequency'])/(s['max_frequency']-s['min_frequency'])))
  return 0
+def uses_reject_only(t):
+ return int(t.get('asic_count') or 1) >= 4
 def stable(t,s):
+ if uses_reject_only(t):
+  return int(t.get('reject_delta') or 0) == 0
  reject_ok=t.get('reject_samples',0)<s.get('reject_min_shares',10) or t.get('reject_pct',0)<=s['max_reject_pct']
  return t.get('error_pct',0)<=s['max_error_pct'] and reject_ok
 def hard_hot(t,s): return (t.get('temp') is not None and t['temp']>=s['max_asic_temp']) or (t.get('vr_temp') is not None and t['vr_temp']>=s['max_vr_temp'])
@@ -99,6 +107,8 @@ def record_optimizer_snapshot(m):
   'timestamp':datetime.now(timezone.utc).isoformat(),
   'miner_name':m.get('name',''),'host':m.get('host',''),'reason':m.get('reason',''),
   'asic_temp_c':t.get('temp'),'vrm_temp_c':t.get('vr_temp'),'fan_pct':t.get('fan'),
+  'asic_count':t.get('asic_count'),'accepted_total':t.get('accepted'),'rejected_total':t.get('rejected'),
+  'accepted_delta':t.get('accepted_delta'),'rejected_delta':t.get('reject_delta'),
   'hashrate_ths':t.get('hashrate'),'power_w':t.get('power'),'j_th':t.get('jth'),
   'hw_error_pct':t.get('error_pct'),'reject_pct':t.get('reject_pct'),
   'frequency_mhz':t.get('frequency'),'core_voltage_mv':t.get('voltage'),
@@ -108,7 +118,7 @@ def record_optimizer_snapshot(m):
 
 @app.get('/api/optimizer-log.csv')
 async def optimizer_log_csv():
- fields=['timestamp','miner_name','host','reason','asic_temp_c','vrm_temp_c','fan_pct',
+ fields=['timestamp','miner_name','host','reason','asic_temp_c','vrm_temp_c','fan_pct','asic_count','accepted_total','rejected_total','accepted_delta','rejected_delta',
  'hashrate_ths','power_w','j_th','hw_error_pct','reject_pct','frequency_mhz','core_voltage_mv',
  'asic_target_c','vrm_target_c','fan_target_pct']
  out=io.StringIO()
@@ -337,11 +347,11 @@ async def optimize(mid):
    allowed_v=min(s['max_voltage'],base_v+trim_cap)
    if v < allowed_v-0.5:
     nv=min(allowed_v,v+step);m['stability_trim']=nv-base_v
-    await set_fv(m,f,nv);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)';await asyncio.sleep(s['settle_seconds']);continue
+    await set_fv(m,f,nv);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=(f'Rejected share +{int(t.get("reject_delta") or 0)} — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; cumulative rejected {int(t.get("rejected") or 0)})' if uses_reject_only(t) else f'Stability correction — holding {f:.0f} MHz, voltage ↑ to {nv:.0f} mV (trim {m["stability_trim"]:+.0f} mV; HW {t.get("error_pct",0):.2f}% / reject {t.get("reject_pct",0):.2f}%)');await asyncio.sleep(s['settle_seconds']);continue
    nx=max(0,x-s['op_step']);nf,bv=op_to_fv(nx,s);nv=min(s['max_voltage'],bv+trim_cap);m['stability_trim']=nv-bv;await set_fv(m,nf,nv);m['effsearch']={};m['reason']=f'Voltage-trim cap reached and still unstable — frequency ↓ to {nf:.0f} MHz, voltage {nv:.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
   # Use the configured HW-error budget instead of chasing 0% errors.
   trim=m.get('stability_trim',0.0)
-  if trim>0 and t.get('error_pct',0) <= s['max_error_pct']*float(s.get('trim_decay_error_fraction',0.5)):
+  if (not uses_reject_only(t)) and trim>0 and t.get('error_pct',0) <= s['max_error_pct']*float(s.get('trim_decay_error_fraction',0.5)):
    if m.get('stable_since') is None:m['stable_since']=time.time()
    if time.time()-m['stable_since'] >= s['stability_probe_seconds']:
     f=t.get('frequency') if t.get('frequency') is not None else op_to_fv(x,s)[0]
@@ -352,7 +362,7 @@ async def optimize(mid):
     await set_fv(m,f,nv)
     m['reason']=f'Error budget available — voltage trim ↓ {trim:.0f}→{new_trim:.0f} mV (HW {t.get("error_pct",0):.2f}% / {s["max_error_pct"]:.2f}% limit)'
     await asyncio.sleep(s['settle_seconds']);continue
-  elif t.get('error_pct',0) > s['max_error_pct']*float(s.get('trim_decay_error_fraction',0.5)):
+  elif (not uses_reject_only(t)) and t.get('error_pct',0) > s['max_error_pct']*float(s.get('trim_decay_error_fraction',0.5)):
    m['stable_since']=None
 
   # Probe-fault protection for multi-ASIC miners.
@@ -561,7 +571,14 @@ async def optimize(mid):
    m['mode']='optimizing';m['recovery_since']=None;m['reason']='Thermally recovered — resuming slow coupled F/V optimization'
   # Any target demand retreats F/V. Fan target matters in normal operation; VR target always protects VRM.
   if asic_hot or vr_hot or fan_high:
-   nx=max(0,x-s['op_step']);await set_op(m,nx);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time();m['reason']=f'Thermal/fan demand — coupled F/V ↓ to {nx*100:.0f}% while preserving voltage trim {m.get("stability_trim",0):+.0f} mV';await asyncio.sleep(s['settle_seconds']);continue
+   mult=1.0
+   fan_excess=(t.get('fan')-s['fan_target']) if t.get('fan') is not None else 0
+   if fan_high:
+    if fan_excess>15: mult=3.0
+    elif fan_excess>5: mult=2.0
+   nx=max(0,x-s['op_step']*mult);await set_op(m,nx);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time()
+   m['reason']=f'Thermal/fan demand — fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target; {mult:.0f}x retreat, coupled F/V ↓ to {nx*100:.0f}% preserving trim {m.get("stability_trim",0):+.0f} mV'
+   await asyncio.sleep(s['settle_seconds']);continue
   if (not asic_hot) and (not vr_hot) and fan_low:
    priority=s.get('headroom_priority','efficiency')
    learned_efficiency=bool(m.get('efficiency_lock',False))
