@@ -571,13 +571,22 @@ async def optimize(mid):
    m['mode']='optimizing';m['recovery_since']=None;m['reason']='Thermally recovered — resuming slow coupled F/V optimization'
   # Any target demand retreats F/V. Fan target matters in normal operation; VR target always protects VRM.
   if asic_hot or vr_hot or fan_high:
+   # IMPORTANT: thermal/fan retreat must start from the miner's CURRENT reported
+   # frequency, not an optimizer/search x that may be stale. This guarantees
+   # repeated high-fan cycles keep walking F/V downward instead of sticking.
+   actual_f=t.get('frequency')
+   if actual_f is not None and s['max_frequency']>s['min_frequency']:
+    current_x=max(0.0,min(1.0,(actual_f-s['min_frequency'])/(s['max_frequency']-s['min_frequency'])))
+   else:
+    current_x=x
    mult=1.0
    fan_excess=(t.get('fan')-s['fan_target']) if t.get('fan') is not None else 0
    if fan_high:
     if fan_excess>15: mult=3.0
     elif fan_excess>5: mult=2.0
-   nx=max(0,x-s['op_step']*mult);await set_op(m,nx);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time()
-   m['reason']=f'Thermal/fan demand — fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target; {mult:.0f}x retreat, coupled F/V ↓ to {nx*100:.0f}% preserving trim {m.get("stability_trim",0):+.0f} mV'
+   nx=max(0,current_x-s['op_step']*mult)
+   await set_op(m,nx);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time()
+   m['reason']=f'Thermal/fan demand — fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target; current {current_x*100:.0f}% → {nx*100:.0f}% ({mult:.0f}x retreat), preserving trim {m.get("stability_trim",0):+.0f} mV'
    await asyncio.sleep(s['settle_seconds']);continue
   if (not asic_hot) and (not vr_hot) and fan_low:
    priority=s.get('headroom_priority','efficiency')

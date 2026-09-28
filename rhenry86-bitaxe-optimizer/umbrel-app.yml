@@ -4,7 +4,7 @@ name: Bitaxe Optimizer
 tagline: Optimize Bitaxe miners for temperature, fan speed, stability, and efficiency
 icon: https://raw.githubusercontent.com/rhenry86/bitaxe-optimizer/main/rhenry86-bitaxe-optimizer/icon.svg
 category: bitcoin
-version: "2.7.1"
+version: "2.7.2"
 port: 8080
 description: Automatically tunes Bitaxe/AxeOS miners while balancing ASIC temperature and fan-speed targets, VRM thermals, stability limits, and measured J/TH efficiency.
 developer: rhenry86
@@ -14,7 +14,7 @@ submission: https://github.com/rhenry86/bitaxe-optimizer
 repo: https://github.com/rhenry86/bitaxe-optimizer
 support: https://github.com/rhenry86/bitaxe-optimizer/issues
 gallery: []
-releaseNotes: Four-chip-and-larger miners now ignore HW error percent and react to increases in the cumulative rejected-share counter. Share counter resets are handled safely. CSV logging now shows cumulative and delta share counts. Fan-headroom control now retreats F/V more aggressively when fan demand is far above target.
+releaseNotes: Fixes thermal/fan retreat getting stuck at the same operating percentage. Each cooling correction now derives its starting point from the miner current reported frequency, so continued excess fan demand keeps stepping F/V downward. Includes the 2.7.1 share-counter and fan-control improvements.
 dependencies: []
 path: ""
 defaultUsername: ""
