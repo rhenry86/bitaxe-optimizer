@@ -13,7 +13,7 @@ from fastapi.responses import StreamingResponse
 DATA=Path(os.getenv('DATA_DIR','/data')); DATA.mkdir(parents=True,exist_ok=True)
 DB=DATA/'optimizer.db'; app=FastAPI(title='Bitaxe Optimizer'); miners={}; tasks={}; watchdog_tasks={}
 DEFAULT={
- 'asic_temp_target':55.0,'vr_temp_target':65.0,'fan_target':65.0,'vr_cooling':'shared',
+ 'asic_temp_target':55.0,'vr_temp_target':65.0,'fan_target':65.0,'fan_tolerance':5.0,'fan_ceiling':75.0,'efficiency_strategy':'band_efficiency','vr_cooling':'shared',
  'min_frequency':400.0,'max_frequency':600.0,'min_voltage':1000.0,'max_voltage':1150.0,
  'op_step':0.05,'max_asic_temp':65.0,'max_vr_temp':75.0,'max_error_pct':3.0,'max_reject_pct':1.0,
  'settle_seconds':30,'temp_deadband':0.5,'vr_temp_deadband':1.0,'fan_deadband':2.0,'recovery_seconds':90,
@@ -22,6 +22,7 @@ DEFAULT={
 class MinerIn(BaseModel): name:str; host:str
 class Settings(BaseModel):
  asic_temp_target:float=Field(55,ge=30,le=85); vr_temp_target:float=Field(65,ge=30,le=110); fan_target:float=Field(65,ge=0,le=100)
+ fan_tolerance:float=Field(5,ge=0,le=30); fan_ceiling:float=Field(75,ge=1,le=100); efficiency_strategy:str='band_efficiency'
  vr_cooling:str='shared'; min_frequency:float=Field(400,gt=0); max_frequency:float=Field(600,gt=0)
  min_voltage:float=Field(1000,gt=0); max_voltage:float=Field(1150,gt=0); op_step:float=Field(.05,gt=0,le=.25)
  max_asic_temp:float=Field(65,ge=30,le=100); max_vr_temp:float=Field(75,ge=30,le=120)
@@ -32,7 +33,11 @@ class Settings(BaseModel):
  reject_min_shares:int=Field(10,ge=1,le=1000); trim_decay_error_fraction:float=Field(.5,ge=0,le=1); max_positive_trim:float=Field(60,ge=0,le=250)
 
 def merged_settings(raw):
- d=dict(DEFAULT); d.update(raw or {}); return d
+ raw=dict(raw or {})
+ d=dict(DEFAULT); d.update(raw)
+ if 'efficiency_strategy' not in raw:
+  d['efficiency_strategy']='performance' if raw.get('headroom_priority')=='performance' else 'band_efficiency'
+ return d
 def con(): c=sqlite3.connect(DB);c.row_factory=sqlite3.Row;return c
 def init():
  c=con();c.execute('CREATE TABLE IF NOT EXISTS miners(id INTEGER PRIMARY KEY AUTOINCREMENT,name TEXT,host TEXT,settings TEXT)')
@@ -94,11 +99,16 @@ def hard_hot(t,s): return (t.get('temp') is not None and t['temp']>=s['max_asic_
 def demands(t,s):
  asic=t.get('temp') is not None and t['temp']>s['asic_temp_target']+s['temp_deadband']
  vr=t.get('vr_temp') is not None and t['vr_temp']>s['vr_temp_target']+s['vr_temp_deadband']
- fan=t.get('fan') is not None and t['fan']>s['fan_target']+s['fan_deadband']
+ fan=t.get('fan')
+ strategy=s.get('efficiency_strategy','band_efficiency')
+ lower=max(0.0,s['fan_target']-s.get('fan_tolerance',5.0))
+ upper=min(100.0,s['fan_target']+s.get('fan_tolerance',5.0))
+ fan_limit=s.get('fan_ceiling',75.0) if strategy=='max_efficiency' else min(upper,s.get('fan_ceiling',75.0))
+ fan_high=fan is not None and fan>fan_limit
  cool_asic=t.get('temp') is not None and t['temp']<s['asic_temp_target']-s['temp_deadband']
  cool_vr=t.get('vr_temp') is None or t['vr_temp']<s['vr_temp_target']-s['vr_temp_deadband']
- fan_low=t.get('fan') is not None and t['fan']<s['fan_target']-s['fan_deadband']
- return asic,vr,fan,cool_asic,cool_vr,fan_low
+ fan_low=fan is not None and fan<lower and strategy in ('band_efficiency','performance')
+ return asic,vr,fan_high,cool_asic,cool_vr,fan_low
 optimizer_history=deque(maxlen=20000)
 
 def record_optimizer_snapshot(m):
@@ -113,14 +123,14 @@ def record_optimizer_snapshot(m):
   'hw_error_pct':t.get('error_pct'),'reject_pct':t.get('reject_pct'),
   'frequency_mhz':t.get('frequency'),'core_voltage_mv':t.get('voltage'),
   'asic_target_c':st.get('asic_temp_target'),'vrm_target_c':st.get('vr_temp_target'),
-  'fan_target_pct':st.get('fan_target')
+  'fan_target_pct':st.get('fan_target'),'fan_tolerance_pct':st.get('fan_tolerance'),'fan_ceiling_pct':st.get('fan_ceiling'),'efficiency_strategy':st.get('efficiency_strategy')
  })
 
 @app.get('/api/optimizer-log.csv')
 async def optimizer_log_csv():
  fields=['timestamp','miner_name','host','reason','asic_temp_c','vrm_temp_c','fan_pct','asic_count','accepted_total','rejected_total','accepted_delta','rejected_delta',
  'hashrate_ths','power_w','j_th','hw_error_pct','reject_pct','frequency_mhz','core_voltage_mv',
- 'asic_target_c','vrm_target_c','fan_target_pct']
+ 'asic_target_c','vrm_target_c','fan_target_pct','fan_tolerance_pct','fan_ceiling_pct','efficiency_strategy']
  out=io.StringIO()
  writer=csv.DictWriter(out,fieldnames=fields); writer.writeheader()
  writer.writerows(list(optimizer_history))
@@ -530,7 +540,7 @@ async def optimize(mid):
    await set_fv(m,bf,bv)
    if done:
     bx=fv_to_op(bf,bv,s);_,basev=op_to_fv(bx,s);m['stability_trim']=bv-basev
-    m['efficiency_lock']=s.get('headroom_priority','efficiency')=='efficiency'
+    m['efficiency_lock']=s.get('efficiency_strategy','band_efficiency')=='max_efficiency'
     es.clear();es.update({'phase':'cooldown','sample_f':bf,'sample_v':bv,'samples':[],'sample_since':time.time(),'cooldown_until':time.time()+max(120,s['stability_probe_seconds']*2)})
     m['reason']=f'Efficiency optimum learned — {bf:.0f} MHz / {bv:.0f} mV, {bj:.2f} J/TH avg'
    else:
@@ -580,22 +590,25 @@ async def optimize(mid):
    else:
     current_x=x
    mult=1.0
-   fan_excess=(t.get('fan')-s['fan_target']) if t.get('fan') is not None else 0
+   strategy=s.get('efficiency_strategy','band_efficiency')
+   band_upper=min(100.0,s['fan_target']+s.get('fan_tolerance',5.0))
+   fan_limit=s.get('fan_ceiling',75.0) if strategy=='max_efficiency' else min(band_upper,s.get('fan_ceiling',75.0))
+   fan_excess=(t.get('fan')-fan_limit) if t.get('fan') is not None else 0
    if fan_high:
     if fan_excess>15: mult=3.0
     elif fan_excess>5: mult=2.0
    nx=max(0,current_x-s['op_step']*mult)
    await set_op(m,nx);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time()
-   m['reason']=f'Thermal/fan demand — fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target; current {current_x*100:.0f}% → {nx*100:.0f}% ({mult:.0f}x retreat), preserving trim {m.get("stability_trim",0):+.0f} mV'
+   m['reason']=f'Thermal/fan demand — fan {t.get("fan",0):.0f}% / {fan_limit:.0f}% limit; current {current_x*100:.0f}% → {nx*100:.0f}% ({mult:.0f}x retreat), preserving trim {m.get("stability_trim",0):+.0f} mV'
    await asyncio.sleep(s['settle_seconds']);continue
   if (not asic_hot) and (not vr_hot) and fan_low:
-   priority=s.get('headroom_priority','efficiency')
-   learned_efficiency=bool(m.get('efficiency_lock',False))
-   if priority=='performance' or not learned_efficiency:
-    nx=min(1,x+s['op_step'])
-    if nx>x+0.0001:
-     await set_op(m,nx);m['effsearch']={};m['stable_since']=time.time();m['reason']=f'Fan headroom — coupled F/V ↑ to {nx*100:.0f}% with learned voltage trim {m.get("stability_trim",0):+.0f} mV ({priority} priority)';await asyncio.sleep(s['settle_seconds']);continue
-   m['reason']=f'Unused cooling headroom — Efficiency priority preserving learned J/TH optimum (fan {t.get("fan",0):.0f}% / {s["fan_target"]:.0f}% target)'
+   strategy=s.get('efficiency_strategy','band_efficiency')
+   lower=max(0.0,s['fan_target']-s.get('fan_tolerance',5.0))
+   nx=min(1,x+s['op_step'])
+   if nx>x+0.0001:
+    await set_op(m,nx);m['effsearch']={};m['efficiency_lock']=False;m['stable_since']=time.time()
+    m['reason']=f'Fan below target band — {t.get("fan",0):.0f}% < {lower:.0f}%; coupled F/V ↑ to {nx*100:.0f}% ({strategy})'
+    await asyncio.sleep(s['settle_seconds']);continue
   m['reason']=f'Holding frequency; voltage trim {m.get("stability_trim",0):+.0f} mV — waiting for next efficiency probe'
   await asyncio.sleep(s['settle_seconds'])
 
@@ -722,6 +735,9 @@ async def ss(mid:int,x:Settings):
  if mid not in miners:raise HTTPException(404)
  d=x.model_dump()
  if d['vr_cooling'] not in ('shared','separate','passive'):raise HTTPException(400,'Invalid VRM cooling mode')
+ if d['efficiency_strategy'] not in ('max_efficiency','band_efficiency','performance'):raise HTTPException(400,'Invalid efficiency strategy')
+ if d['fan_target']-d['fan_tolerance']<0 or d['fan_target']+d['fan_tolerance']>100:raise HTTPException(400,'Fan target ± tolerance must stay within 0–100%')
+ if d['fan_ceiling']<d['fan_target']+d['fan_tolerance']:raise HTTPException(400,'Fan ceiling must be at or above the top of the target band')
  if d['max_frequency']<=d['min_frequency'] or d['max_voltage']<=d['min_voltage']:raise HTTPException(400,'Maximums must exceed minimums')
  if d['max_asic_temp']<=d['asic_temp_target'] or d['max_vr_temp']<=d['vr_temp_target']:raise HTTPException(400,'Hard thermal maximums must exceed targets')
  was_locked=bool(miners[mid]['settings'].get('lock_fv'))
