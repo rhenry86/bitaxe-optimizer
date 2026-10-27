@@ -3,8 +3,10 @@ import server
 import watchdog_patch
 import reconnect_patch
 import diagnostics_patch
+import ui_patch
 
-# Apply reliability hardening before FastAPI startup creates miner tasks.
+# Apply UI and reliability hardening before FastAPI startup creates miner tasks.
+ui_patch.install()
 watchdog_patch.install(server)
 reconnect_patch.install(server)
 diagnostics_patch.install(server)
