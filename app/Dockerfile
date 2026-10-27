@@ -5,6 +5,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY server.py .
 COPY runner.py .
 COPY watchdog_patch.py .
+COPY reconnect_patch.py .
+COPY reconnect.js .
 COPY static ./static
 ENV DATA_DIR=/data PYTHONUNBUFFERED=1
 EXPOSE 8080
