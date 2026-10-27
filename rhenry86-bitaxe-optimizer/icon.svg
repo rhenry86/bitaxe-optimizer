@@ -1,1 +1,44 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#111827"/><circle cx="256" cy="256" r="154" fill="#f59e0b"/><text x="256" y="330" text-anchor="middle" font-family="sans-serif" font-size="220" font-weight="700" fill="#111827">₿</text></svg>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Bitaxe Optimizer">
+  <defs>
+    <linearGradient id="bg" x1="76" y1="58" x2="430" y2="454" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#1b1d22" stop-opacity="0.96"/>
+      <stop offset="1" stop-color="#0d0f12" stop-opacity="0.90"/>
+    </linearGradient>
+    <linearGradient id="chip" x1="168" y1="158" x2="348" y2="358" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ffbd45"/>
+      <stop offset="0.55" stop-color="#f59e0b"/>
+      <stop offset="1" stop-color="#e17800"/>
+    </linearGradient>
+    <filter id="glow" x="-80%" y="-80%" width="260%" height="260%">
+      <feGaussianBlur stdDeviation="20"/>
+    </filter>
+    <filter id="soft" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#000" flood-opacity="0.38"/>
+    </filter>
+  </defs>
+
+  <!-- transparent canvas; graphite glass tile -->
+  <rect x="28" y="28" width="456" height="456" rx="112" fill="url(#bg)" stroke="#3a3d45" stroke-opacity="0.72" stroke-width="4" filter="url(#soft)"/>
+  <rect x="52" y="52" width="408" height="408" rx="92" fill="none" stroke="#ffffff" stroke-opacity="0.045" stroke-width="2"/>
+
+  <!-- translucent orange halo -->
+  <circle cx="256" cy="256" r="132" fill="#f59e0b" fill-opacity="0.18" filter="url(#glow)"/>
+
+  <!-- chip pins -->
+  <g stroke="url(#chip)" stroke-width="16" stroke-linecap="round">
+    <path d="M180 120v34M226 120v34M286 120v34M332 120v34"/>
+    <path d="M180 358v34M226 358v34M286 358v34M332 358v34"/>
+    <path d="M120 180h34M120 226h34M120 286h34M120 332h34"/>
+    <path d="M358 180h34M358 226h34M358 286h34M358 332h34"/>
+  </g>
+
+  <!-- chip body -->
+  <rect x="156" y="156" width="200" height="200" rx="42" fill="#17191e" fill-opacity="0.92" stroke="url(#chip)" stroke-width="14"/>
+  <rect x="178" y="178" width="156" height="156" rx="30" fill="#0f1115" fill-opacity="0.78" stroke="#ffffff" stroke-opacity="0.06" stroke-width="2"/>
+
+  <!-- optimizer bolt -->
+  <path d="M278 194l-62 78h42l-27 58 68-86h-42l21-50z" fill="url(#chip)"/>
+
+  <!-- tiny efficiency tick -->
+  <path d="M203 316h106" stroke="#f59e0b" stroke-opacity="0.42" stroke-width="6" stroke-linecap="round"/>
+</svg>
