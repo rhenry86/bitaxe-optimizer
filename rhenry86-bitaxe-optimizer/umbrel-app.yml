@@ -4,7 +4,7 @@ name: Bitaxe Optimizer
 tagline: Optimize Bitaxe miners for temperature, fan speed, stability, and efficiency
 icon: https://raw.githubusercontent.com/rhenry86/bitaxe-optimizer/main/rhenry86-bitaxe-optimizer/icon.svg
 category: bitcoin
-version: "3.0.0"
+version: "3.1.0"
 port: 8080
 description: Automatically tunes Bitaxe/AxeOS miners while balancing ASIC temperature and fan-speed targets, VRM thermals, stability limits, and measured J/TH efficiency.
 developer: rhenry86
@@ -14,7 +14,7 @@ submission: https://github.com/rhenry86/bitaxe-optimizer
 repo: https://github.com/rhenry86/bitaxe-optimizer
 support: https://github.com/rhenry86/bitaxe-optimizer/issues
 gallery: []
-releaseNotes: Cleans up stability telemetry by showing HW Error % only on miners below 4 ASICs and cumulative rejected-share totals/deltas on QAxe, NerdQ, OctAxe, and other 4+ chip miners. Removes the misleading recent rejected percentage display.
+releaseNotes: Adds persistent Auto reconnect & resume optimization, so miners automatically resume after temporary disconnects, optimizer task failures, or Umbrel/container restarts unless intentionally paused. Also hardens the OctAxe AxeOS WebSocket watchdog so fragmented chip-hashrate messages are reassembled and fault detection/recovery remains reliable.
 dependencies: []
 path: ""
 defaultUsername: ""
