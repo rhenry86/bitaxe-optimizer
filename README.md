@@ -17,3 +17,7 @@ Frequency and voltage move together along one normalized operating-point axis be
 If the operating point reaches minimum F/V and ASIC temperature remains above target, the app enables AxeOS Auto Fan and stays at minimum F/V. It does not force 100% fan. It waits until fan speed falls below the configured target/deadband before resuming coupled F/V optimization.
 
 Efficiency probes are retained only when J/TH improves without violating error/reject limits or materially worsening the thermal/fan objective.
+
+## AI continuity / project handoff
+
+Before continuing in a new chat or agent session, read [`AGENTS.md`](AGENTS.md), [`README_FOR_AI.md`](README_FOR_AI.md), [`PROJECT_STATE.md`](PROJECT_STATE.md) and [`WORK_LOG.md`](WORK_LOG.md). Update state/log at least every 30 minutes of **actual active work**, and before ending a session. This checkpoint convention does not run during idle time.
