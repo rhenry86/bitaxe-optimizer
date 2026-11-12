@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-import asyncio,json,os,sqlite3,time,ipaddress,socket,re,base64,hashlib,struct,secrets
+import asyncio,json,os,sqlite3,time,ipaddress,socket,re,base64,hashlib,struct,secrets,logging
 from pathlib import Path
 from fastapi import FastAPI,HTTPException
 from fastapi.responses import FileResponse
@@ -159,6 +159,54 @@ async def set_op(m,x):
  return await set_fv(m,f,v+trim)
 async def auto_fan(m,on=True): await patch(m['host'],{'autofanspeed':1 if on else 0})
 
+ZERO_HASH_SECONDS = 60
+ZERO_HASH_RESTART_COOLDOWN = 300
+logger = logging.getLogger('uvicorn.error')
+
+
+async def restart_miner(m):
+ async with httpx.AsyncClient(timeout=10) as client:
+  response = await client.post(base(m['host']) + '/api/system/restart')
+  response.raise_for_status()
+
+
+async def recover_zero_hashrate(m, raw, telemetry):
+ now = time.monotonic()
+ task = tasks.get(m['id'])
+ chip = m.get('chip_watchdog') or {}
+ rate = raw.get('hashRate')
+ if rate is None:
+  rate = raw.get('hashRate_1m')
+ if (task is None or task.done() or task.cancelling()
+     or type(rate) not in (int, float) or rate != 0
+     or telemetry.get('accepted_delta', 0) > 0 or hard_hot(telemetry, m['settings'])
+     or raw.get('overheat_mode') or raw.get('miningPaused')
+     or chip.get('recovery_pending') or time.time() < chip.get('hold_until', 0)):
+  m.pop('zero_hash_since', None)
+  return
+
+ since = m.setdefault('zero_hash_since', now)
+ uptime = num(raw, 'uptimeSeconds')
+ if (now - since < ZERO_HASH_SECONDS or (uptime is not None and uptime < ZERO_HASH_SECONDS)
+     or now < m.get('zero_hash_retry_at', 0)):
+  return
+
+ # Set both timers before sending the request. A reboot can interrupt its own response.
+ m['zero_hash_retry_at'] = now + ZERO_HASH_RESTART_COOLDOWN
+ m['zero_hash_hold_until'] = now + ZERO_HASH_SECONDS
+ m.pop('zero_hash_since', None)
+ m['last_shares'] = None
+ engine = _v3_state(m)
+ engine['probe'] = None
+ engine['stable_since'] = None
+ m['reason'] = 'Zero hashrate for 60 seconds; restarting AxeOS'
+ logger.info('Miner %s: %s', m['id'], m['reason'])
+ try:
+  await restart_miner(m)
+ except httpx.HTTPError as exc:
+  logger.warning('Miner %s: zero-hashrate restart response unconfirmed (%s)', m['id'], type(exc).__name__)
+
+
 # OctAxe individual-chip watchdog.
 # Deliberately isolated from /api/system/info polling and optimizer logic.
 # AxeOS realtime logs are streamed at ws://<miner>/api/ws.
@@ -233,7 +281,7 @@ async def chip_watchdog(mid):
   m=miners[mid];writer=None
   try:
    reader,writer=await _open_log_ws(m['host'])
-   m['chip_watchdog']={'connected':True,'threshold_pct':70,'required_samples':3,'rates':[],'status':'Monitoring'}
+   m.setdefault('chip_watchdog',{}).update({'connected':True,'threshold_pct':70,'required_samples':3,'rates':[],'status':'Monitoring'})
    while mid in miners:
     payload=await asyncio.wait_for(_ws_read_frame(reader,writer),timeout=90)
     if payload is None:continue
@@ -245,7 +293,7 @@ async def chip_watchdog(mid):
     wd.update({'connected':True,'threshold_pct':70,'required_samples':3,'rates':rates,'last_update':time.time()})
 
     # Suppress fault decisions during a post-restart stabilization hold.
-    if time.time()<wd.get('hold_until',0):
+    if time.time()<wd.get('hold_until',0) or time.monotonic()<m.get('zero_hash_hold_until',0):
      bad=[0]*8;wd['status']='Post-restart stabilization hold';continue
 
     fault=None
@@ -275,8 +323,7 @@ async def chip_watchdog(mid):
                 'fault_time':time.time(),'unsafe_frequency':bad_f,'unsafe_voltage':bad_v,'recovery_pending':True})
      m['effsearch']={};m['efficiency_lock']=False
      m['reason']=f'ASIC #{i+1} fault — {h:.1f} GH/s vs {peer_avg:.1f} peer avg ({ratio*100:.0f}%); restarting AxeOS for stock recovery'
-     async with httpx.AsyncClient(timeout=10) as c:
-      r=await c.post(base(m['host'])+'/api/system/restart');r.raise_for_status()
+     await restart_miner(m)
      wd['hold_until']=time.time()+ASIC_WATCH_RECOVERY_HOLD
      bad=[0]*8
      # Restart will normally close this socket; reconnect cleanly either way.
@@ -303,7 +350,8 @@ async def poll(mid):
  while mid in miners:
   m=miners[mid]
   try:
-   t=norm(await getj(m['host'],'/api/system/info'),m);m['telemetry']=t;m['online']=True
+   raw=await getj(m['host'],'/api/system/info')
+   t=norm(raw,m);m['telemetry']=t;m['online']=True
    if uses_reject_only(t) and int(t.get('reject_delta') or 0)>0:
     m['reject_event_seq']=m.get('reject_event_seq',0)+int(t.get('reject_delta') or 0)
    wd=m.get('chip_watchdog') or {}
@@ -322,9 +370,12 @@ async def poll(mid):
     except Exception:
      # Leave recovery_pending set so the next normal poll retries safely.
      pass
+   await recover_zero_hashrate(m,raw,t)
    record_optimizer_snapshot(m)
    c=con();c.execute('INSERT INTO samples(miner_id,ts,payload) VALUES(?,?,?)',(mid,time.time(),json.dumps(t)));c.commit();c.close()
-  except Exception:m['online']=False
+  except Exception:
+   m['online']=False
+   m.pop('zero_hash_since',None)
   await asyncio.sleep(5)
 # v3 optimizer: one decision per cycle, strict priority order.
 # Safety > stability > cooling constraints > strategy > efficiency probing.
@@ -363,6 +414,9 @@ async def optimize(mid):
   s=m['settings'];t=m.get('telemetry',{});now=time.time()
   if not m.get('online') or not t:
    m['reason']='Waiting for telemetry';await asyncio.sleep(5);continue
+
+  if time.monotonic()<m.get('zero_hash_hold_until',0) and not hard_hot(t,s):
+   m['reason']='Zero-hashrate restart: waiting for AxeOS to resume hashing';await asyncio.sleep(5);continue
 
   # Lock means F/V only. Never touch fan settings.
   if s.get('lock_fv'):
