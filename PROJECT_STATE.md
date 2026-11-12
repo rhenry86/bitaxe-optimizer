@@ -27,3 +27,10 @@
 
 - `README.md`, `app/`, `rhenry86-bitaxe-optimizer/`, `.github/`
 - `AGENTS.md` and `WORK_LOG.md` for required 30-minute active-work checkpoints.
+
+## 2026-11-12 — Zero-hashrate recovery
+
+- The 3.4.1 source adds a watchdog to the normal AxeOS telemetry poll. It detects a full-miner stall independently of chip logs and sends an AxeOS reboot after 60 seconds of observed zero hashrate while the optimizer is active.
+- Missing telemetry, new accepted shares, pause, thermal limits and an active chip recovery interrupt detection. Recent miner startup defers a restart. A restart attempt starts a 60-second settling period and a five-minute per-miner retry cooldown.
+- Local checks used simulated telemetry and a reboot response interrupted by a dropped connection. The diagnostics endpoint returned HTTP 530. Umbrel and physical miner recovery remain unverified.
+- Publish via the existing Docker workflow and apply the 3.4.1 update in Umbrel. Roll back to the previously installed image digest if recovery regresses.
